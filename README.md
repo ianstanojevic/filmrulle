@@ -65,8 +65,16 @@ skärmen men påverkar aldrig exportens kvalitet.
 | Eterna | cinematisk, låg mättnad, flat, lätt grön |
 | Nostalgic Neg | varm bärnsten, lyfta skuggor, 70-talskänsla |
 | Astia | mjuk kontrast, mild mättnad, smickrande hud |
+| Porträtt 160 | ännu lägre kontrast + finare korn än 400, subtila mjuka färger |
+| Pro 400H | luftig, svala dämpade gröna/blå, rena högdagrar |
+| Provia 100F | neutral dia — sansad mättnad, naturtrogna färger (Velvias motpol) |
+| Cinestill 50D | slät, finkornig dagsljusfilm, mycket balanserad palett |
+| Cinestill 800T | tungsten-sval med utpräglad röd/orange halation kring ljus |
+| ColorPlus 200 | budget-look, mjuk kontrast, varm men urblekt |
+| Agfa Vista | punchig konsumentfilm, magenta i skuggorna |
 | HP5 · Svartvitt | korn + kontrast |
 | Tri-X 400 | grittig, kontrastrik dokumentär-svartvitt |
+| Acros | ren svartvitt, djup kontrast, krispig skärpa, finkornig |
 
 ## Design & vy
 
