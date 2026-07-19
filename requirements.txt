@@ -1,0 +1,6 @@
+numpy>=1.24
+Pillow>=10.0
+pyinstaller>=6.0
+# valfria — HEIC- respektive RAW-stöd (appen funkar utan dem)
+pillow-heif>=1.0
+rawpy>=0.25
