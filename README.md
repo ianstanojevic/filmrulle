@@ -5,6 +5,26 @@ En liten, fristående fotoredigerare för **analoga / retro filmsimuleringar**.
 
 Ingen molntjänst, inga konton — all bildbehandling görs lokalt i numpy + Pillow.
 
+![Filmrulle — huvudvyn med Guld 200](docs/huvudvy_mork.jpg)
+
+**26 filmrecept** — från Porträtt 400 och Velvia till Polaroid SX-70 och Tri-X:
+
+![Samma foto i åtta olika filmer](docs/filmer.jpg)
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/fore_efter.jpg" alt="Före och efter: original mot Porträtt 400"></td>
+    <td width="50%"><img src="docs/jamfor.jpg" alt="Jämför-läget: två recept sida vid sida"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Före / efter — original mot Porträtt 400</em></td>
+    <td align="center"><em>Jämför två recept sida vid sida</em></td>
+  </tr>
+</table>
+
+![Ljust tema med tonkurva och justeringspanel](docs/justera_ljus.jpg)
+<p align="center"><em>Ljust tema · egen tonkurva · reglage för exponering, korn, halation, vinjett m.m.</em></p>
+
 ## Kör
 
 **Färdig exe:** `dist\Filmrulle.exe` (dubbelklicka — inga beroenden behövs).
