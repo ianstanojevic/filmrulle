@@ -4,3 +4,4 @@ build/
 dist/
 *.spec
 filmrulle_old.ico.bak
+.pytest_cache/

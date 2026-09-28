@@ -23,14 +23,19 @@ import json
 import math
 import os
 import queue
+import re
+import sys
 import threading
 import time
 import tkinter as tk
+import traceback
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields as dc_fields, replace
-from tkinter import filedialog, font as tkfont, simpledialog
+from functools import lru_cache
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
+from PIL import Image, ImageFilter, ImageOps, ImageTk
 
 # mjuka beroenden: HEIC (pillow-heif) och RAW (rawpy) — appen funkar utan dem,
 # men kan då inte öppna de formaten
@@ -46,32 +51,116 @@ try:
 except Exception:      # noqa: BLE001
     RAW_OK = False
 
-VERSION = "2.0"
+VERSION = "2.1"
 SESSION_EXT = ".filmrulle"
 PRESETS_FILE = os.path.join(os.path.expanduser("~"),
                             ".filmrulle_presets.json")
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"),
                              ".filmrulle_settings.json")
+ERROR_LOG = os.path.join(os.path.expanduser("~"), ".filmrulle_errors.log")
 RAW_EXTS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2"}
 HEIF_EXTS = {".heic", ".heif"}
 
 
+def _write_json_atomic(path, data):
+    """Skriv JSON via temp-fil + os.replace. Ett avbrott mitt i skrivningen
+    (krasch, full disk, strömavbrott) lämnar då den GAMLA filen orörd — med
+    en direkt skrivning blev den halvskriven och oläsbar, vilket för
+    presets-filen betydde att alla egna looks försvann vid nästa start."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def load_settings():
-    """Små appinställningar som ska minnas mellan körningar (just nu bara
-    tema). Egen fil, separat från presets — olika livslängd/syfte."""
+    """Små appinställningar som ska minnas mellan körningar (tema, fönster,
+    exportformat). Egen fil, separat från presets — olika livslängd/syfte.
+    Returnerar ALLTID en dict: giltig JSON av fel form ("[]", "null") fick
+    tidigare appen att krascha vid start."""
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:      # noqa: BLE001 — ingen fil = defaultinställningar
+            d = json.load(f)
+    except Exception:      # noqa: BLE001 — ingen/trasig fil = default
         return {}
+    return d if isinstance(d, dict) else {}
 
 
 def save_settings(d):
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=1)
+        _write_json_atomic(SETTINGS_FILE, d)
+    except Exception:      # noqa: BLE001 — kosmetiskt, aldrig kritiskt
+        pass
+
+
+def log_error(context, exc_info=None):
+    """Skriv ett undantag med traceback till ERROR_LOG. Den byggda exe:n
+    (--windowed) saknar konsol, så utan loggen försvinner varje fel i en
+    Tk-callback eller arbetartråd spårlöst — användaren ser bara att något
+    'inte händer'. Roteras vid ~256 KB. Får aldrig själv kasta."""
+    try:
+        et, ev, tb = exc_info or sys.exc_info()
+        if et is None:
+            return
+        text = "".join(traceback.format_exception(et, ev, tb))
+        if os.path.exists(ERROR_LOG) and os.path.getsize(ERROR_LOG) > 256_000:
+            os.replace(ERROR_LOG, ERROR_LOG + ".1")
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"v{VERSION} [{context}]\n{text}\n")
     except Exception:      # noqa: BLE001
         pass
+
+
+def _finite(v, default):
+    """float(v) om det är ett ändligt tal, annars `default` (skyddar mot
+    NaN/inf/strängar i handredigerade eller trasiga JSON-filer)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _magic(path):
+    """Filens första bytes — filändelsen ljuger ibland, innehållet gör det inte."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4)
+    except OSError:
+        return b""
+
+
+def _route(path):
+    """Välj avkodare på filens INNEHÅLL, inte bara ändelsen. Returnerar
+    (använd_rawpy, pillow_fallback_tillåten).
+
+    - En fil kan heta .dng men vara en vanlig JPEG (kameraappar sparar om
+      bilden vid överföring till mobil utan att byta ändelse) → Pillow.
+    - Ett TIFF-baserat RAW-format (DNG/NEF/ARW/CR2…) som LibRaw inte klarar
+      får INTE falla tillbaka på Pillow: Pillow öppnar då filens inbäddade
+      förhandsvisning (för en GR III-DNG 160×120 px) och man får tyst en
+      frimärksstor bild istället för ett fel."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in RAW_EXTS:
+        return False, True
+    m = _magic(path)
+    if m[:3] == b"\xff\xd8\xff" or m == b"\x89PNG":
+        return False, True
+    return True, m[:2] not in (b"II", b"MM")
+
+
+def _open_raw(path):
+    if not RAW_OK:
+        raise RuntimeError("RAW-stöd saknas (installera rawpy)")
+    return rawpy.imread(path)
 
 
 def load_rgb(path):
@@ -79,20 +168,175 @@ def load_rgb(path):
     Vanliga format (+ HEIC om pillow-heif finns) via Pillow i 8 bitar; RAW via
     rawpy i **16 bitar** — kamerans sensor levererar 12–14 bitar per kanal,
     och en tidig avrundning till 8 bitar (256 nivåer) kastar tondjup som
-    annars finns kvar vid kraftiga skugglyft/highlight-recovery. Delas av
-    ALLA inläsningsvägar (import, session, spara, export) så både
-    formatstöd och bitdjup är konsekvent överallt."""
+    annars finns kvar vid kraftiga skugglyft/highlight-recovery. Används för
+    Spara/Exportera (full upplösning); importen använder `load_preview`."""
+    use_raw, fallback_ok = _route(path)
+    if use_raw:
+        try:
+            with _open_raw(path) as raw:
+                rgb16 = raw.postprocess(use_camera_wb=True, output_bps=16)
+            a = rgb16.astype(np.float32)
+            del rgb16
+            a *= np.float32(1.0 / 65535.0)     # in-place: ingen extra 290 MB-kopia
+            return a
+        except Exception:      # noqa: BLE001
+            if not fallback_ok:
+                raise
     ext = os.path.splitext(path)[1].lower()
-    if ext in RAW_EXTS:
-        if not RAW_OK:
-            raise RuntimeError("RAW-stöd saknas (installera rawpy)")
-        with rawpy.imread(path) as raw:
-            rgb16 = raw.postprocess(use_camera_wb=True, output_bps=16)
-        return rgb16.astype(np.float32) / 65535.0
     if ext in HEIF_EXTS and not HEIF_OK:
         raise RuntimeError("HEIC-stöd saknas (installera pillow-heif)")
-    im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
-    return np.asarray(im, np.float32) / 255.0
+    # `with` stänger filen direkt — flerbildsformat (MPO-JPEG från många
+    # kameror, TIFF, HEIC) höll annars filen låst i Windows tills GC:n kom
+    with Image.open(path) as im:
+        rgb = ImageOps.exif_transpose(im).convert("RGB")
+    a = np.asarray(rgb, np.float32)
+    a /= 255.0
+    return a
+
+
+def load_preview(path, max_side=None):
+    """Snabb och minnessnål inläsning för IMPORT → (PIL RGB ≤ max_side px,
+    fullbredd, fullhöjd). Förhandsvisningen är ändå 8 bitar och ≤1400 px, så
+    att avkoda full upplösning i float32 (som importen gjorde) var slöseri —
+    ~290 MB temporärt per GR III-DNG. RAW avkodas nu i halv upplösning/8
+    bitar (verifierat: medelfärg inom <1/255 av full avkodning), JPEG skalas
+    redan i DCT-steget via draft(). Fullmåtten (för info-raden) läses ur
+    filhuvudet, med hänsyn till orientering. Uppmätt på 7 riktiga GR III-/
+    iPhone-filer: 6.0 → 1.8 s totalt (DNG 1.8 → 0.6 s, JPEG 0.6 → 0.13 s)."""
+    max_side = max_side or PREVIEW_MAX
+    use_raw, fallback_ok = _route(path)
+    if use_raw:
+        try:
+            with _open_raw(path) as raw:
+                s = raw.sizes
+                full_w, full_h = ((s.height, s.width) if s.flip in (5, 6)
+                                  else (s.width, s.height))
+                rgb = raw.postprocess(use_camera_wb=True, half_size=True,
+                                      output_bps=8)
+            im = Image.fromarray(rgb)
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
+            return im, full_w, full_h
+        except Exception:      # noqa: BLE001
+            if not fallback_ok:
+                raise
+    ext = os.path.splitext(path)[1].lower()
+    if ext in HEIF_EXTS and not HEIF_OK:
+        raise RuntimeError("HEIC-stöd saknas (installera pillow-heif)")
+    with Image.open(path) as im:
+        full_w, full_h = im.size
+        try:
+            orient = im.getexif().get(0x0112, 1)
+        except Exception:      # noqa: BLE001 — trasig EXIF = ingen rotation
+            orient = 1
+        if orient in (5, 6, 7, 8):
+            full_w, full_h = full_h, full_w
+        if im.format in ("JPEG", "MPO"):
+            k = max_side / max(im.size)
+            if k < 1.0:
+                im.draft("RGB", (max(1, int(im.size[0] * k)),
+                                 max(1, int(im.size[1] * k))))
+        out = ImageOps.exif_transpose(im).convert("RGB")
+    out.thumbnail((max_side, max_side), Image.LANCZOS)
+    return out, full_w, full_h
+
+
+def as_float01(arr):
+    """uint8-bild → float32 0–1 (förhandsvisningar lagras som uint8 för att
+    ta 4× mindre RAM); float-arrayer passerar orörda."""
+    if arr is None or arr.dtype != np.uint8:
+        return arr
+    a = arr.astype(np.float32)
+    a /= 255.0
+    return a
+
+
+# EXIF-taggar som bärs över till exporten (IFD0). Resten av IFD0 i en RAW/
+# TIFF-källa är strukturtaggar (bredd, strip-offsets, SubIFDs …) som skulle
+# bli skräp i en JPEG. MakerNote/Interop släpps: tillverkarnas MakerNotes
+# innehåller ofta ABSOLUTA filoffsets som blir fel när blocket flyttas, och
+# de spräcker lätt JPEG:ens 64 KB-gräns för EXIF.
+_EXIF_KEEP = (0x010F, 0x0110, 0x0132, 0x013B, 0x8298)   # Make Model DateTime Artist Copyright
+_EXIF_DROP_SUB = {0x927C, 0xA005}                          # MakerNote, Interop-pekare
+
+
+def read_meta(path):
+    """EXIF + ICC-profil ur källfilen, för att bäras över till exporten.
+    Utan dem tappade varje export tagningsdatum/kamera (bildbibliotek sorterar
+    på DateTimeOriginal) och — för iPhone-bilder i Display P3 — färgprofilen,
+    så exporten tolkades som sRGB och såg urblekt ut. Aldrig ett undantag:
+    saknad/trasig metadata = exportera utan."""
+    meta = {"exif": None, "icc": None}
+    try:
+        with Image.open(path) as im:
+            icc = im.info.get("icc_profile")
+            if icc:
+                meta["icc"] = icc
+            src = im.getexif()
+            dst = Image.Exif()
+            for t in _EXIF_KEEP:
+                if t in src:
+                    dst[t] = src[t]
+            dst[0x0112] = 1                   # pixlarna är redan uppräta
+            dst[0x0131] = f"Filmrulle {VERSION}"
+            sub = {k: v for k, v in src.get_ifd(0x8769).items()
+                   if k not in _EXIF_DROP_SUB}
+            if sub:
+                dst[0x8769] = sub
+            gps = src.get_ifd(0x8825)
+            if gps:
+                dst[0x8825] = dict(gps)
+            b = dst.tobytes()
+            if len(b) < 60000:                # JPEG APP1 rymmer max ~64 KB
+                meta["exif"] = b
+    except Exception:      # noqa: BLE001 — RAW som Pillow inte kan läsa m.m.
+        pass
+    return meta
+
+
+def save_image_file(pil, path, quality=95, meta=None):
+    """Skriv en bild med format ur filändelsen (JPEG = vald kvalitet, PNG/
+    TIFF = förlustfritt, TIFF LZW), med källans EXIF + ICC. Skrivs till en
+    temporär fil som byts in först när den är komplett — en avbruten export
+    lämnar aldrig en halv, trasig bildfil med rätt namn."""
+    ext = os.path.splitext(path)[1].lower()
+    fmt = Image.registered_extensions().get(ext)
+    if fmt is None:
+        raise ValueError(f"Okänt filformat: {ext or '(ingen ändelse)'}")
+    meta = meta or {}
+    kw = {}
+    if meta.get("icc") and fmt in ("JPEG", "PNG", "TIFF"):
+        kw["icc_profile"] = meta["icc"]
+    if meta.get("exif") and fmt in ("JPEG", "PNG", "TIFF"):
+        kw["exif"] = meta["exif"]
+        if fmt == "TIFF":
+            # libtiff kan inte skriva de nästlade EXIF-/GPS-IFD:erna som
+            # Pillow skickar vidare ("Bad LONG8 … EXIFIFDOffset") → TIFF
+            # får bara IFD0-taggarna (kamera, datum, orientering)
+            flat = Image.Exif()
+            flat.load(meta["exif"])
+            for t in (0x8769, 0x8825):
+                flat.pop(t, None)
+            kw["exif"] = flat.tobytes()
+    if fmt == "JPEG":
+        kw.update(quality=int(quality), subsampling=0)
+    elif fmt == "TIFF":
+        kw["compression"] = "tiff_lzw"
+    tmp = path + ".part"
+    try:
+        try:
+            pil.save(tmp, format=fmt, **kw)
+        except (ValueError, OSError, RuntimeError):
+            if "exif" not in kw:
+                raise
+            kw.pop("exif")                    # ovanlig EXIF som formatet vägrar
+            pil.save(tmp, format=fmt, **kw)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 # ----------------------------------------------------------------- palett
 # Två teman med IDENTISKA nycklar. Namnen nedan (WALL, PAPER, …) är globala
@@ -164,6 +408,29 @@ IMPORT_EXTS = ({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
                | HEIF_EXTS | RAW_EXTS)
 
 
+def mouse_buttons(platform=sys.platform, tk_version=tk.TkVersion):
+    """(högerklick, mittenklick) som Tk-händelser. Tk 8.6 på macOS numrerar
+    HÖGER-knappen 2 och mittenknappen 3 — omvänt mot Windows/X11 (ändrat i
+    Tk 8.7). Hårdkodat <Button-3>/<Button-2> gjorde att högerklick i
+    Mac-bygget började panorera och 'högerklick = ta bort' aldrig nåddes."""
+    if platform == "darwin" and tk_version < 8.7:
+        return "<Button-2>", "<Button-3>"
+    return "<Button-3>", "<Button-2>"
+
+
+RIGHT_BTN, MIDDLE_BTN = mouse_buttons()
+
+
+def wheel_units(delta, platform=sys.platform):
+    """MouseWheel-delta i 'Windows-enheter' (120 per hjulsteg). Tk på Windows
+    ger ±120 per steg, men Tk 8.6 på macOS ±1 (och täta småvärden från
+    styrplattan) — utan normalisering var scroll-zoomen i Mac-bygget i
+    praktiken död (1.0015**1 ≈ 0.15 % per steg)."""
+    if platform == "darwin" and abs(delta) < 120:
+        return delta * 30
+    return delta
+
+
 def _resolve_family(cands):
     """Välj första installerade typsnittsfamiljen (kräver att en Tk-root finns)."""
     try:
@@ -199,7 +466,11 @@ class Grade:
     bw: bool = False
     tone: tuple = (0.0, 0.0, 0.0)
     curves: dict = field(default=None)
-    grain_size: float = 1.0      # 1 = per pixel, större = grövre korn
+    # kornstorlek i px (1 = per pixel, större = grövre). Standard = UI:ts
+    # standard: filmbyte läser nu filmens egen kornstorlek/struktur till
+    # reglagen (tidigare skrevs de alltid över med 1.5/0, så Tri-X:s 1.6
+    # var död kod och sparade presets tappade sin kornkaraktär)
+    grain_size: float = DEFAULT_GS
     grain_rough: float = 0.0     # 0 = mjukt/molnigt, 100 = hårt/gryning korn
     user_curve: list = field(default=None)   # användarens tonkurva [(x,y)…]
 
@@ -225,9 +496,9 @@ FILMS = [
         split=0.28, grain=10,
         curves={"b": [(0, 0.0), (0.5, 0.47), (1, 0.92)]})),
     ("velvia", "Velvia", "mättad · knivskarp", Grade(
-        temp=-6, contrast=26, saturation=34, fade=0, grain=6,
-        curves={"r": [(0, 0), (0.25, 0.2), (0.75, 0.82), (1, 1)],
-                "g": [(0, 0), (0.25, 0.22), (0.75, 0.8), (1, 1)]})),
+        temp=-6, contrast=18, saturation=22, fade=0, grain=6,
+        curves={"r": [(0, 0), (0.25, 0.23), (0.75, 0.79), (1, 1)],
+                "g": [(0, 0), (0.25, 0.24), (0.75, 0.78), (1, 1)]})),
     ("krom", "Krom 64", "ren · sval", Grade(
         temp=-14, tint=-4, contrast=14, saturation=8, grain=6,
         highlight_tint=(-0.03, 0.0, 0.05))),
@@ -315,38 +586,102 @@ FILMS = [
 FILM_BY_KEY = {f[0]: f for f in FILMS}
 
 
+def film_entry(key):
+    """FILMS-posten för `key`, med Original som fallback. En nyckel kan peka
+    på en egen preset som raderats (ångra-historik, urklipp, äldre projekt)
+    — det gav tidigare KeyError mitt i ett ångra och ett halvt återställt UI."""
+    return FILM_BY_KEY.get(key) or FILM_BY_KEY["original"]
+
+
+def film_slug(key):
+    """Filnamnsvänligt filmnamn för exporter: inbyggda filmer använder sin
+    nyckel ('velvia'), egna presets sitt namn — inte 'user_1721234567890'."""
+    if not key.startswith("user_"):
+        return key
+    label = film_entry(key)[1] if key in FILM_BY_KEY else ""
+    slug = re.sub(r"[^\w-]+", "_", str(label)).strip("_")
+    return slug or "egen"
+
+
 # =====================================================================
 #  Egna presets — användarens sparade looks, egna kort i remsan
 # =====================================================================
 
+def sanitize_curve(pts):
+    """Tolerant tolkning av en tonkurva ([[x,y],…]): skräp slängs, värden
+    klämms till 0–1, sorteras på x och punkter med (nästan) samma x slås
+    ihop. Dubbla x gav tidigare en nollbred PCHIP-sektion → exploderande
+    lutning och en spik/solarisering i bilden. None om < 2 giltiga punkter."""
+    if not isinstance(pts, (list, tuple)):
+        return None
+    clean = []
+    for p in pts:
+        if not isinstance(p, (list, tuple)) or len(p) < 2:
+            continue
+        x, y = _finite(p[0], None), _finite(p[1], None)
+        if x is None or y is None:
+            continue
+        clean.append([_clampf(x, 0.0, 1.0), _clampf(y, 0.0, 1.0)])
+    clean.sort(key=lambda q: q[0])
+    out = []
+    for q in clean:
+        if out and q[0] - out[-1][0] < 0.005:
+            out[-1] = q                      # senare punkt vinner
+        else:
+            out.append(q)
+    return out if len(out) >= 2 else None
+
+
 def _grade_from_dict(d):
-    """Grade ur JSON-dict; tolerant mot okända/gamla fält."""
-    valid = {f.name for f in dc_fields(Grade)}
-    kw = {k: v for k, v in d.items() if k in valid}
-    for tup in ("shadow_tint", "highlight_tint", "tone"):
-        if isinstance(kw.get(tup), list):
-            kw[tup] = tuple(kw[tup])
-    return Grade(**kw)
+    """Grade ur JSON-dict — tolerant mot okända/gamla fält OCH fel typer.
+    Ett fält av fel typ (t.ex. "temp": "varm") klarade sig förut förbi
+    inläsningen men kraschade sedan varje rendering med den filmen."""
+    g = Grade()
+    if not isinstance(d, dict):
+        return g
+    for f in dc_fields(Grade):
+        if f.name not in d:
+            continue
+        v, cur = d[f.name], getattr(g, f.name)
+        if isinstance(cur, bool):
+            if isinstance(v, bool):
+                setattr(g, f.name, v)
+        elif isinstance(cur, (int, float)):
+            setattr(g, f.name, _finite(v, cur))
+        elif isinstance(cur, tuple):
+            if isinstance(v, (list, tuple)) and len(v) == 3:
+                setattr(g, f.name, tuple(_finite(t, 0.0) for t in v))
+        elif f.name == "curves":
+            if isinstance(v, dict):
+                cv = {ch: sanitize_curve(v.get(ch)) for ch in "rgb"}
+                setattr(g, f.name, {k: c for k, c in cv.items() if c} or None)
+        elif f.name == "user_curve":
+            setattr(g, f.name, sanitize_curve(v))
+    g.grain_size = _clampf(g.grain_size, 1.0, 5.0)
+    g.grain_rough = _clampf(g.grain_rough, 0.0, 100.0)
+    return g
 
 
 def load_user_presets():
     """Läs in sparade presets och registrera dem som filmer i remsan.
     Körs vid appstart INNAN korten byggs och sessioner läses (EditState.
-    from_dict validerar film_key mot FILM_BY_KEY)."""
+    from_dict validerar film_key mot FILM_BY_KEY). Varje post valideras för
+    sig — en trasig fil fick tidigare hela appen att krascha vid start."""
     try:
         with open(PRESETS_FILE, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:      # noqa: BLE001 — ingen fil = inga presets
         return
-    for p in data.get("presets", []):
-        key, label = p.get("key"), p.get("label", "Egen")
-        if not key or not key.startswith("user_") or key in FILM_BY_KEY:
+    presets = data.get("presets") if isinstance(data, dict) else None
+    for p in presets if isinstance(presets, list) else []:
+        if not isinstance(p, dict):
             continue
-        try:
-            entry = (key, label, "egen preset", _grade_from_dict(
-                p.get("grade", {})))
-        except Exception:      # noqa: BLE001 — korrupt preset hoppas över
+        key, label = p.get("key"), p.get("label")
+        if not isinstance(key, str) or not key.startswith("user_") \
+                or key in FILM_BY_KEY:
             continue
+        label = label if isinstance(label, str) and label.strip() else "Egen"
+        entry = (key, label, "egen preset", _grade_from_dict(p.get("grade")))
         FILMS.append(entry)
         FILM_BY_KEY[key] = entry
 
@@ -355,10 +690,9 @@ def save_user_presets():
     presets = [{"key": k, "label": lab, "grade": asdict(g)}
                for k, lab, _s, g in FILMS if k.startswith("user_")]
     try:
-        with open(PRESETS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"presets": presets}, f, indent=1)
+        _write_json_atomic(PRESETS_FILE, {"presets": presets})
     except Exception:      # noqa: BLE001
-        pass
+        log_error("save_user_presets")
 
 
 # =====================================================================
@@ -412,22 +746,59 @@ class EditState:
 
     @staticmethod
     def from_dict(d):
+        """Tolerant mot trasiga/handredigerade projektfiler: varje fält
+        valideras för sig (typ, ändlighet, intervall) och faller annars
+        tillbaka på standardvärdet. Tidigare fällde ett enda dåligt fält
+        ("crop": null → TypeError) hela projektet, och NaN-värden (som
+        JSON tillåter) gav helt svarta bilder. Äldre projekt med
+        "local_adjust" ignoreras tyst."""
         e = EditState()
-        e.film_key = d.get("film_key", "original")
-        if e.film_key not in FILM_BY_KEY:
-            e.film_key = "original"
-        adj = d.get("adjust", {})
-        e.adjust = {k: float(adj.get(k, 0.0)) for k in ADJ_FIELDS}
-        e.grain_size = float(d.get("grain_size", DEFAULT_GS))
-        e.grain_rough = float(d.get("grain_rough", 0.0))
-        e.strength = float(d.get("strength", 100.0))
-        c = d.get("crop", NO_CROP)
-        e.crop = tuple(float(v) for v in c) if len(c) == 4 else NO_CROP
-        e.angle = float(d.get("angle", 0.0))
-        cv = d.get("curve")
-        e.curve = [[float(p[0]), float(p[1])] for p in cv] \
-            if cv and len(cv) >= 2 else None
-        return e            # (äldre projekt med "local_adjust" ignoreras tyst)
+        if not isinstance(d, dict):
+            return e
+        fk = d.get("film_key")
+        e.film_key = fk if isinstance(fk, str) and fk in FILM_BY_KEY \
+            else "original"
+        adj = d.get("adjust")
+        if isinstance(adj, dict):
+            e.adjust = {k: _finite(adj.get(k), 0.0) for k in ADJ_FIELDS}
+        e.grain_size = _clampf(_finite(d.get("grain_size"), DEFAULT_GS),
+                               1.0, 5.0)
+        e.grain_rough = _clampf(_finite(d.get("grain_rough"), 0.0), 0.0, 100.0)
+        e.strength = _clampf(_finite(d.get("strength"), 100.0), 0.0, 100.0)
+        e.crop = _valid_crop(d.get("crop"))
+        e.angle = _clampf(_finite(d.get("angle"), 0.0), -45.0, 45.0)
+        e.curve = sanitize_curve(d.get("curve"))
+        return e
+
+
+def _resolve_project_path(entry, pdir):
+    """Fotots sökväg ur en projektpost: den absoluta om den finns, annars
+    den RELATIVA till projektfilen (mappen har flyttats), annars den
+    absoluta ändå — så att importen kan rapportera att fotot saknas."""
+    p = entry.get("path")
+    p = p if isinstance(p, str) else ""
+    if p and os.path.exists(p):
+        return p
+    r = entry.get("rel")
+    if isinstance(r, str) and r:
+        cand = os.path.normpath(os.path.join(pdir, r))
+        if os.path.exists(cand):
+            return cand
+    return p
+
+
+def _valid_crop(c):
+    """Normaliserad beskärning (x0,y0,x1,y1) i 0–1 med positiv yta, annars
+    ingen beskärning."""
+    if not isinstance(c, (list, tuple)) or len(c) != 4:
+        return NO_CROP
+    v = [_finite(t, None) for t in c]
+    if None in v:
+        return NO_CROP
+    x0, y0, x1, y1 = (_clampf(t, 0.0, 1.0) for t in v)
+    if x1 - x0 < 0.01 or y1 - y0 < 0.01:
+        return NO_CROP
+    return (x0, y0, x1, y1)
 
 
 def curve_is_active(pts):
@@ -454,6 +825,19 @@ class PhotoItem:
     edit: EditState = field(default_factory=EditState)
     rating: int = 0                  # -1 = ratad, 0 = neutral, +1 = utvald
     uid: int = field(default_factory=lambda: next(_uid_seq))
+
+
+def make_photo_item(path, prev_img, full_w, full_h):
+    """Bygg ett rullfoto ur en förhandsvisning (PIL). Förhandsvisningen
+    lagras som **uint8** (3.9 MB för 1400 px) istället för float32 (15.7 MB)
+    — en rulle med 200 foton tog annars ~3 GB RAM bara för dessa. Bara det
+    AKTIVA fotot konverteras till float (i `_activate`). Tumnageln (240 px)
+    används i varje rullkorts-/filmremsrendering och får förbli float32."""
+    th = prev_img.copy()
+    th.thumbnail((THUMB_SRC, THUMB_SRC), Image.LANCZOS)
+    return PhotoItem(path=path, prev_arr=np.array(prev_img, np.uint8),
+                     thumb_src=as_float01(np.array(th, np.uint8)),
+                     w=int(full_w), h=int(full_h))
 
 
 def apply_geometry(arr, crop, angle):
@@ -485,7 +869,7 @@ def apply_geometry(arr, crop, angle):
 def grade_from_edit(edit):
     """Bygg en klampad Grade från ett EditState. Delas av live-förhandsvisning,
     Spara och Exportera alla så alla tre ger identiskt resultat."""
-    g = replace(FILM_BY_KEY[edit.film_key][3])
+    g = replace(film_entry(edit.film_key)[3])
     for fkey in ADJ_FIELDS:
         setattr(g, fkey, getattr(g, fkey) + edit.adjust.get(fkey, 0.0))
     g.exposure = _clampf(g.exposure, -3, 3)
@@ -500,8 +884,7 @@ def grade_from_edit(edit):
     g.grain_size = _clampf(edit.grain_size, 1.0, 5.0)
     g.grain_rough = _clampf(edit.grain_rough, 0.0, 100.0)
     if curve_is_active(edit.curve):
-        g.user_curve = sorted((float(p[0]), float(p[1]))
-                              for p in edit.curve)
+        g.user_curve = sanitize_curve(edit.curve)
     return g
 
 
@@ -509,10 +892,46 @@ def grade_from_edit(edit):
 #  Bildpipeline (numpy, float32 0–1)  — oförändrad kärna
 # =====================================================================
 
+# Kurvor slås upp i en 65536-LUT istället för np.interp per pixel: ~2× snabbare
+# (np.interp konverterar till float64 och binärsöker per värde), och felet —
+# indata kvantiseras till 1/65535 — ligger >100× under en 8-bitarsnivå.
+_LUT_N = 65536
+_LUT_X = np.linspace(0.0, 1.0, _LUT_N)
+
+
+def _lut_apply(chan, lut):
+    """Slå upp en (redan 0–1-klämd) kanal i en _LUT_N-LUT."""
+    idx = chan * np.float32(_LUT_N - 1)
+    idx += np.float32(0.5)
+    return lut[idx.astype(np.uint16)]
+
+
+@lru_cache(maxsize=64)
+def _curve_lut(key):
+    """Linjär (filmernas inbakade) kurva → LUT. `key` = tuple av (x, y)."""
+    xs = [p[0] for p in key]
+    ys = [p[1] for p in key]
+    lut = np.interp(_LUT_X, xs, ys).astype(np.float32)
+    lut.flags.writeable = False              # delad via cachen
+    return lut
+
+
+@lru_cache(maxsize=32)
+def _user_curve_lut(key):
+    """Användarens PCHIP-tonkurva → LUT (samma 256-punkters PCHIP som
+    editorn ritar, linjärt interpolerad mellan de punkterna)."""
+    gx, gy = _pchip_lut(key)
+    lut = np.interp(_LUT_X, gx, gy).astype(np.float32)
+    lut.flags.writeable = False
+    return lut
+
+
+def _curve_key(pts):
+    return tuple((float(p[0]), float(p[1])) for p in pts)
+
+
 def _apply_curve(chan, pts):
-    xs = np.array([p[0] for p in pts], dtype=np.float32)
-    ys = np.array([p[1] for p in pts], dtype=np.float32)
-    return np.interp(chan, xs, ys).astype(np.float32)
+    return _lut_apply(chan, _curve_lut(_curve_key(pts)))
 
 
 def _pchip_lut(pts, n=256):
@@ -551,6 +970,14 @@ def _pchip_lut(pts, n=256):
     return gx.astype(np.float32), np.clip(gy, 0, 1).astype(np.float32)
 
 
+def _hist_peak(chans):
+    """Normaliseringstak för histogram. De yttersta binnarna (rena svart-/
+    vitspikar från klippta skuggor/himmel) räknas inte — de kan bli många
+    gånger högre än resten och tryckte annars ner hela kurvan till en rand."""
+    inner = [h[1:-1] if len(h) > 2 else h for h in chans]
+    return max(1, int(np.concatenate(inner).max()))
+
+
 def _mix_hex(a, b, t):
     """Blanda två '#rrggbb'-färger (t=0 -> a, t=1 -> b)."""
     a, b = a.lstrip("#"), b.lstrip("#")
@@ -560,35 +987,76 @@ def _mix_hex(a, b, t):
 
 
 class VignetteCache:
-    """Cachar den FÄRDIGKURVADE fallofmasken (r**2.2) — potensen på en
-    hel kanal är dyr och beräknades tidigare om vid varje rendering trots
-    att själva radiemasken var cachad."""
+    """Cachar den FÄRDIGKURVADE fallofmasken (r**2.2) per bildstorlek.
+
+    Höll tidigare bara EN storlek, men förhandsvisning (1400 px), filmremsans
+    tumnaglar, rullkort och export använder olika storlekar — cachen
+    räknades om vid varje växling (~60 ms per byte). Nu en liten LRU; masker
+    över ~4 MP (export) cachas inte, de används en gång och är stora.
+    Masken byggs med broadcasting av två 1D-axlar istället för np.mgrid
+    (som allokerade två fullstora int64-arrayer — ~380 MB vid 24 MP)."""
+
+    MAX_ENTRIES = 4
+    MAX_CACHED_PIXELS = 4_000_000
 
     def __init__(self):
-        self._k = None
-        self._m = None
+        self._cache = OrderedDict()
         self._lock = threading.Lock()   # delas mellan preview- och batch-tråd
 
     def get(self, h, w):
+        key = (h, w)
         with self._lock:
-            if self._k != (h, w):
-                yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-                cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
-                nx = (xx - cx) / (w / 2.0)
-                ny = (yy - cy) / (h / 2.0)
-                r = np.sqrt(nx * nx + ny * ny) / 1.41421356
-                m = np.clip(r, 0, 1).astype(np.float32)
-                self._m = (m ** 2.2).astype(np.float32)
-                self._k = (h, w)
-            return self._m
+            m = self._cache.get(key)
+            if m is not None:
+                self._cache.move_to_end(key)
+                return m
+        cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+        ny = (np.arange(h, dtype=np.float32) - cy) / (h / 2.0)
+        nx = (np.arange(w, dtype=np.float32) - cx) / (w / 2.0)
+        r = np.sqrt(nx[None, :] * nx[None, :] + ny[:, None] * ny[:, None])
+        r /= 1.41421356
+        np.clip(r, 0, 1, out=r)
+        m = (r ** 2.2).astype(np.float32)
+        m.flags.writeable = False
+        if h * w <= self.MAX_CACHED_PIXELS:
+            with self._lock:
+                self._cache[key] = m
+                while len(self._cache) > self.MAX_ENTRIES:
+                    self._cache.popitem(last=False)
+        return m
 
 
 _VIG = VignetteCache()
+_LUMA_W = np.array([0.299, 0.587, 0.114], np.float32)
 
 
 def _luma(arr):
-    return (arr[..., 0] * 0.299 + arr[..., 1] * 0.587
-            + arr[..., 2] * 0.114).astype(np.float32)
+    """Luminans (Rec. 601) som EN matris-vektorprodukt — tre strided
+    kanalmultiplikationer + summa + astype-kopia var ~4× långsammare."""
+    return arr @ _LUMA_W
+
+
+def _chan_add(x, m, coef=(1.0, 1.0, 1.0)):
+    """x[..., c] += m * coef[c], kanal för kanal. Att broadcasta en
+    (h,w)-mask som m[..., None] mot (h,w,3) — eller bilda ytterprodukten
+    m[..., None] * vektor — är 4–6× långsammare i numpy än tre kanalvisa
+    pass: den inre dimensionen (3) ger en kort, ineffektiv inre loop. Det
+    mönstret stod för ungefär hälften av renderingstiden."""
+    for c in range(3):
+        k = coef[c]
+        if k == 0:
+            continue
+        xc = x[..., c]
+        if k == 1:
+            xc += m
+        else:
+            xc += m * np.float32(k)
+
+
+def _chan_mul(x, m):
+    for c in range(3):
+        xc = x[..., c]
+        xc *= m
 
 
 def _blur_f(chan, rad):
@@ -619,25 +1087,30 @@ def _blur_big(chan, rad):
 
 
 def process(arr, g, seed=1234):
-    """Hela filmpipelinen. Arbetar IN-PLACE på en egen kopia (`x`) —
-    varje `x = np.clip(...)`/aritmetisk omskrivning i den gamla versionen
-    allokerade en ny ~16 MB-buffer per steg för en 1400px-förhandsvisning;
-    med `out=x` och `+=`-former återanvänds samma buffer genom hela kedjan."""
+    """Hela filmpipelinen. Arbetar IN-PLACE på en egen kopia (`x`), och
+    alla steg som applicerar en (h,w)-mask på bilden gör det kanal för
+    kanal (`_chan_add`/`_chan_mul`) — samma formler och samma ordning som
+    v2.0 (bevisat mot en fryst referens i testsviten), men ~2× snabbare.
+    Uppmätt mot referensen i samma körning, 1400 px: Velvia 139 → 68 ms,
+    Natt 800T 213 → 111 ms, Polaroid 178 → 85 ms."""
     x = arr.astype(np.float32, copy=True)
-    if g.exposure:
-        x *= float(2.0 ** g.exposure)
-    if g.temp or g.tint:
-        t = g.temp / 100.0
-        ti = g.tint / 100.0
-        x[..., 0] *= (1.0 + 0.35 * t) * (1.0 + 0.10 * ti)
-        x[..., 1] *= 1.0 - 0.20 * ti
-        x[..., 2] *= (1.0 - 0.35 * t) * (1.0 + 0.10 * ti)
+    if g.exposure or g.temp or g.tint:
+        # exponering + vitbalans som EN förstärkning per kanal
+        ev = float(2.0 ** g.exposure) if g.exposure else 1.0
+        t, ti = g.temp / 100.0, g.tint / 100.0
+        gains = ((1.0 + 0.35 * t) * (1.0 + 0.10 * ti),
+                 1.0 - 0.20 * ti,
+                 (1.0 - 0.35 * t) * (1.0 + 0.10 * ti))
+        for c in range(3):
+            k = ev * gains[c]
+            if k != 1.0:
+                xc = x[..., c]
+                xc *= np.float32(k)
     np.clip(x, 0.0, 1.0, out=x)
     if g.contrast:
         f = 1.0 + (g.contrast / 100.0) * 0.9
-        x -= 0.5
-        x *= f
-        x += 0.5
+        x *= np.float32(f)                   # (x-0.5)*f+0.5 i två pass
+        x += np.float32(0.5 * (1.0 - f))
         np.clip(x, 0.0, 1.0, out=x)
     if g.curves:
         for i, ch in enumerate("rgb"):
@@ -646,46 +1119,44 @@ def process(arr, g, seed=1234):
                 x[..., i] = _apply_curve(x[..., i], pts)
     if g.user_curve:
         # användarens egen tonkurva — OVANPÅ filmens inbakade kurvor.
-        # Mjuk monoton PCHIP via LUT (samma matematik som editorns ritning)
-        gx, gy = _pchip_lut(g.user_curve)
+        # Mjuk monoton PCHIP via LUT (samma matematik som editorns ritning);
+        # LUT:ens värden ligger redan i 0–1, ingen klämning behövs
+        lut = _user_curve_lut(_curve_key(g.user_curve))
         for i in range(3):
-            x[..., i] = np.interp(x[..., i], gx, gy).astype(np.float32)
-        np.clip(x, 0.0, 1.0, out=x)
+            x[..., i] = _lut_apply(x[..., i], lut)
     if g.saturation:
         s = 1.0 + g.saturation / 100.0
-        lum = _luma(x)[..., None]
-        x -= lum
-        x *= s
-        x += lum
+        lum = _luma(x)                       # (x-lum)*s+lum == x*s+lum*(1-s)
+        x *= np.float32(s)
+        lum *= np.float32(1.0 - s)
+        _chan_add(x, lum)
         np.clip(x, 0.0, 1.0, out=x)
     if g.split and (any(g.shadow_tint) or any(g.highlight_tint)):
         lum = _luma(x)
-        sh = ((1.0 - lum) * g.split)[..., None]
-        hi = (lum * g.split)[..., None]
-        x += sh * np.array(g.shadow_tint, np.float32)
-        x += hi * np.array(g.highlight_tint, np.float32)
+        _chan_add(x, (1.0 - lum) * g.split, g.shadow_tint)
+        _chan_add(x, lum * g.split, g.highlight_tint)
         np.clip(x, 0.0, 1.0, out=x)
     if g.bw:
-        lum = _luma(x)[..., None]
-        x = np.repeat(lum, 3, axis=2)
+        lum = _luma(x)
+        x = np.repeat(lum[..., None], 3, axis=2)
         if any(g.tone):
-            mid = 1.0 - np.abs(2.0 * lum - 1.0)
-            x += mid * np.array(g.tone, np.float32)
+            _chan_add(x, 1.0 - np.abs(2.0 * lum - 1.0), g.tone)
             np.clip(x, 0.0, 1.0, out=x)
     if g.fade:
         fd = g.fade / 100.0
         floor = 0.09 * fd
-        x *= 1.0 - floor - 0.04 * fd
-        x += floor
+        x *= np.float32(1.0 - floor - 0.04 * fd)
+        x += np.float32(floor)
         np.clip(x, 0.0, 1.0, out=x)
     if g.clarity:
         # lokal mellantonskontrast: oskarp mask med STOR radie på luminansen
         h, w = x.shape[:2]
         lum = _luma(x)
         rad = max(2.0, min(h, w) * 0.02)
-        detail = (lum - _blur_big(lum, rad))[..., None]
-        midweight = (1.0 - np.abs(2.0 * lum - 1.0))[..., None]  # spar högdager/skugga
-        x += detail * midweight * (g.clarity / 100.0 * 0.9)
+        d = lum - _blur_big(lum, rad)
+        d *= 1.0 - np.abs(2.0 * lum - 1.0)   # spar högdager/skugga
+        d *= np.float32(g.clarity / 100.0 * 0.9)
+        _chan_add(x, d)
         np.clip(x, 0.0, 1.0, out=x)
     if g.sharpen:
         # oskarp mask med liten radie på LUMINANSEN — en blur istället för
@@ -694,7 +1165,9 @@ def process(arr, g, seed=1234):
         h, w = x.shape[:2]
         rad = max(0.6, min(h, w) * 0.0015)
         lum = _luma(x)
-        x += (lum - _blur_f(lum, rad))[..., None] * (g.sharpen / 100.0 * 1.4)
+        d = lum - _blur_f(lum, rad)
+        d *= np.float32(g.sharpen / 100.0 * 1.4)
+        _chan_add(x, d)
         np.clip(x, 0.0, 1.0, out=x)
     if g.halation:
         h, w = x.shape[:2]
@@ -704,9 +1177,10 @@ def process(arr, g, seed=1234):
         mask *= np.sqrt(mask)       # == mask**1.5, men sqrt är hårdvarusnabb
         radius = max(2.0, min(h, w) * 0.02)   # bredare, mer filmisk spridning
         glow = _blur_big(mask, radius)
-        amt = g.halation / 100.0 * 1.6        # kraftigare intensitet
-        halo = np.array([1.0, 0.32, 0.14], np.float32)
-        x += glow[..., None] * halo * amt
+        amt = np.float32(g.halation / 100.0 * 1.6)   # kraftigare intensitet
+        for c, k in enumerate((1.0, 0.32, 0.14)):    # röd-orange glöd
+            xc = x[..., c]
+            xc += glow * np.float32(k) * amt
         np.clip(x, 0.0, 1.0, out=x)
     if g.grain:
         h, w = x.shape[:2]
@@ -736,13 +1210,13 @@ def process(arr, g, seed=1234):
         # subtila så man kan dosera finkorn, och en lägre topp (0.09) sänker
         # den totala intensiteten jämfört med den tidigare linjära 0.14.
         t = g.grain / 100.0
-        amt = (t ** 1.35) * 0.09
-        x += (noise * weight * amt)[..., None]
+        d = noise * weight                  # (noise kan vara skrivskyddad)
+        d *= np.float32((t ** 1.35) * 0.09)
+        _chan_add(x, d)
         np.clip(x, 0.0, 1.0, out=x)
     if g.vignette:
         m = _VIG.get(x.shape[0], x.shape[1])   # redan **2.2-kurvad i cachen
-        amt = g.vignette / 100.0
-        x *= (1.0 - amt * m)[..., None]
+        _chan_mul(x, 1.0 - (g.vignette / 100.0) * m)
     np.clip(x, 0.0, 1.0, out=x)
     return x
 
@@ -1178,6 +1652,7 @@ class Renderer(threading.Thread):
             try:
                 self.out.put((token, process(src, grade)))
             except Exception as e:      # noqa: BLE001
+                log_error("render")
                 self.out.put((token, e))
 
 
@@ -1233,7 +1708,10 @@ class Track(tk.Frame):
         if self.on_grab and now - self._last_grab > 1.2:
             self.on_grab()
         self._last_grab = now
-        self.set(self.value + self._step_size() * (1 if e.delta > 0 else -1))
+        step = self._step_size()
+        v = self.value + step * (1 if e.delta > 0 else -1)
+        # snappa till steget: upprepad addition av 0.1 gav 0.30000000000000004
+        self.set(round(round(v / step) * step, 10))
         if self.on_change:
             self.on_change()
 
@@ -1312,7 +1790,7 @@ class CurveEditor(tk.Frame):
         self.cv.bind("<Button-1>", self._press)
         self.cv.bind("<B1-Motion>", self._motion)
         self.cv.bind("<ButtonRelease-1>", self._release)
-        self.cv.bind("<Button-3>", self._remove)
+        self.cv.bind(RIGHT_BTN, self._remove)
         self.cv.bind("<Motion>", self._on_hover)
         self.cv.bind("<Leave>", self._on_leave)
         self.cv.bind("<Configure>", lambda e: self._redraw())
@@ -1344,16 +1822,27 @@ class CurveEditor(tk.Frame):
         return None
 
     # ---- interaktion ----
+    MIN_GAP = 0.02   # minsta x-avstånd mellan punkter (samma som vid drag)
+
     def _press(self, e):
         if self.on_grab:
             self.on_grab()          # ångra-ögonblick före ändring
         i = self._hit(e.x, e.y)
-        if i is None:               # klick på tom yta = ny punkt
+        if i is None:               # klick på tom yta = ny punkt …
             x, y = self._to_norm(e.x, e.y)
-            self.pts.append([x, y])
-            self.pts.sort(key=lambda p: p[0])
-            i = next(j for j, p in enumerate(self.pts)
-                     if p[0] == x and p[1] == y)
+            near = min(range(len(self.pts)),
+                       key=lambda j: abs(self.pts[j][0] - x))
+            if abs(self.pts[near][0] - x) < self.MIN_GAP:
+                # … utom om x hamnar för nära en befintlig punkt (t.ex. klick
+                # i marginalen, där x kläms till 0/1): då skapades förut en
+                # punkt med SAMMA x som ändpunkten → nollbred PCHIP-sektion
+                # och en spik i kurvan. Ta istället tag i den närmaste punkten.
+                i = near
+            else:
+                self.pts.append([x, y])
+                self.pts.sort(key=lambda p: p[0])
+                i = next(j for j, p in enumerate(self.pts)
+                         if p[0] == x and p[1] == y)
         self._drag = i
         self._motion(e)
 
@@ -1405,9 +1894,7 @@ class CurveEditor(tk.Frame):
 
     # ---- API ----
     def set_points(self, pts):
-        self.pts = [[float(p[0]), float(p[1])] for p in pts] \
-            if pts and len(pts) >= 2 else [[0.0, 0.0], [1.0, 1.0]]
-        self.pts.sort(key=lambda p: p[0])
+        self.pts = sanitize_curve(pts) or [[0.0, 0.0], [1.0, 1.0]]
         self._drag = None
         self._hover = None
         self._redraw()
@@ -1429,8 +1916,8 @@ class CurveEditor(tk.Frame):
             small = arr[::max(1, arr.shape[0] // 140),
                         ::max(1, arr.shape[1] // 180)]
             hv, _ = np.histogram(_luma(small), bins=48, range=(0.0, 1.0))
-            peak = max(1, int(hv.max()))
-            self._hist = (hv / peak).astype(np.float32)
+            self._hist = np.minimum(hv / _hist_peak([hv]), 1.0) \
+                .astype(np.float32)
         self._redraw()
 
     # ---- ritning ----
@@ -1525,9 +2012,9 @@ class App(tk.Tk):
                                       "Palatino Linotype", "serif"])
         self.sans = _resolve_family(["Segoe UI", "Corbel", "Arial"])
         try:
-            self._icon = ImageTk.PhotoImage(make_icon_image(64))
+            self._icon = ImageTk.PhotoImage(make_icon_image(64), master=self)
             self.iconphoto(True, self._icon)
-        except Exception:
+        except Exception:      # noqa: BLE001 — kosmetiskt
             pass
 
         self.prev_arr = None
@@ -1588,11 +2075,17 @@ class App(tk.Tk):
         self._compare_mode = False
         self._compare_uid = None
         self._cmp_imgs = []
-        # export-inställningar (delas av Spara + Exportera alla)
+        # export-inställningar (delas av Spara + Exportera alla) — minns
+        # mellan körningar via settings-filen (som tema/maximerat), annars
+        # hoppade format+kvalitet tillbaka till JPEG/95 vid varje omstart
         self._export_open = False
-        self.export_fmt = "JPEG"      # JPEG | PNG | TIFF
-        self.jpeg_quality = 95
+        self.export_fmt = self._settings.get("export_fmt", "JPEG")
+        if self.export_fmt not in ("JPEG", "PNG", "TIFF"):
+            self.export_fmt = "JPEG"
+        self.jpeg_quality = int(_clampf(
+            _finite(self._settings.get("jpeg_quality"), 95), 60, 100))
         self._fmt_cards = {}
+        self._settings_after = None   # debounce: settings skrivs inte per drag
 
         # trådad import (fil-I/O utanför GUI-tråden)
         self._importing = False
@@ -1607,6 +2100,14 @@ class App(tk.Tk):
         self._thumb_queue = []
         self._thumb_src_ref = None
         self._resize_after = None     # debounce av fönsterresize-omritning
+        self._poll_after = None
+        # renderingscacher — nyckel = receptets signatur, så bara det som
+        # faktiskt ändrats renderas om (ångra, synka, tembyte, jämförelse)
+        self._roll_img_cache = {}     # uid -> (signatur, PhotoImage)
+        self._cmp_cache = None        # (uid, signatur, PIL) — jämförelsebilden
+        self._cmp_disp = None         # ((uid, signatur, dw, dh), PhotoImage)
+        self._crop_src_ref = None     # beskärningsvyns rotation: (källa, vinkel)
+        self._crop_img_key = None     #   … och dess skalade PhotoImage-nyckel
 
         load_user_presets()           # egna presets in i FILMS före kortbygget
 
@@ -1617,25 +2118,32 @@ class App(tk.Tk):
         self._renderer.start()
 
         self._build_ui()
-        self.after(30, self._poll_render)
+        self._poll_after = self.after(30, self._poll_render)
         self.after(300, self._enable_dnd)   # fönstret måste finnas först
         self.after(50, self._apply_titlebar_theme)  # hwnd måste finnas först
         self.bind("<Configure>", self._on_resize)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # tangentbord
-        self.bind("<Control-o>", lambda e: self.open_image())
-        self.bind("<Control-s>", lambda e: self.save_image())
-        self.bind("<Control-b>", lambda e: self.export_all())
-        self.bind("<Control-c>", lambda e: self.copy_settings())
-        self.bind("<Control-v>", lambda e: self.paste_settings())
-        self.bind("<Control-Shift-V>", lambda e: self.sync_active_to_all())
-        self.bind("<Control-Left>", lambda e: self._nav(-1))
-        self.bind("<Control-Right>", lambda e: self._nav(1))
-        self.bind("<Control-z>", lambda e: self.undo())
-        self.bind("<Control-y>", lambda e: self.redo())
-        self.bind("<Control-Shift-Z>", lambda e: self.redo())
-        self.bind("<Control-Shift-S>", lambda e: self.save_session())
+        # tangentbord — Ctrl på Windows; på macOS dessutom Cmd, som Mac-
+        # användare förväntar sig (Mac-bygget hade bara Ctrl-varianterna)
+        shortcuts = [
+            ("<Control-o>", lambda e: self.open_image()),
+            ("<Control-s>", lambda e: self.save_image()),
+            ("<Control-b>", lambda e: self.export_all()),
+            ("<Control-c>", lambda e: self.copy_settings()),
+            ("<Control-v>", lambda e: self.paste_settings()),
+            ("<Control-Shift-V>", lambda e: self.sync_active_to_all()),
+            ("<Control-Left>", lambda e: self._nav(-1)),
+            ("<Control-Right>", lambda e: self._nav(1)),
+            ("<Control-z>", lambda e: self.undo()),
+            ("<Control-y>", lambda e: self.redo()),
+            ("<Control-Shift-Z>", lambda e: self.redo()),
+            ("<Control-Shift-S>", lambda e: self.save_session()),
+        ]
+        for seq, fn in shortcuts:
+            self.bind(seq, fn)
+            if sys.platform == "darwin":
+                self.bind(seq.replace("Control", "Command"), fn)
         self.bind("<Delete>", lambda e: self.remove_active_photo())
         self.bind("<KeyPress-space>", self._show_original)
         self.bind("<KeyRelease-space>", self._show_graded)
@@ -1651,6 +2159,24 @@ class App(tk.Tk):
     # -------- typsnitts-hjälpare --------
     def sf(self, size, *style):
         return (self.serif, size, *style)
+
+    # -------- fel & bekräftelser --------
+    def report_callback_exception(self, exc, val, tb):
+        """Tk anropar denna för undantag i callbacks. Standardversionen
+        skriver till stderr — som inte finns i den byggda exe:n — så felet
+        försvann spårlöst. Nu loggas det och syns i statusraden."""
+        log_error("callback", (exc, val, tb))
+        try:
+            self.name_lbl.configure(
+                text=f"Ett fel inträffade ({exc.__name__}) — se "
+                     f"{os.path.basename(ERROR_LOG)} i hemkatalogen")
+        except Exception:      # noqa: BLE001 — UI:t kan vara halvrivet
+            pass
+
+    def _confirm(self, title, msg):
+        """Ja/nej-dialog före destruktiva åtgärder (separat metod så att
+        testerna kan svara utan modala fönster)."""
+        return messagebox.askyesno(title, msg, parent=self)
 
     def _on_escape(self, _=None):
         """Escape backar ut ur det 'innersta' läget först: beskärning →
@@ -1674,8 +2200,12 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------- UI-bygge
     def _build_ui(self):
-        self._blank = tk.PhotoImage(width=CARD_W, height=CARD_IMG_H)
-        self._roll_blank = tk.PhotoImage(width=ROLL_W, height=ROLL_H)
+        # master=self: utan den hamnar bilden i den FÖRSTA Tk-tolken som
+        # skapats i processen, och en andra App-instans kraschade
+        self._blank = tk.PhotoImage(master=self, width=CARD_W,
+                                    height=CARD_IMG_H)
+        self._roll_blank = tk.PhotoImage(master=self, width=ROLL_W,
+                                         height=ROLL_H)
 
         # ---- header ----
         head = tk.Frame(self, bg=PAPER, height=52)
@@ -1790,15 +2320,18 @@ class App(tk.Tk):
         # bildinfo (filnamn · mått · index) har en EGEN label här — headerns
         # name_lbl är enbart för statusmeddelanden; tidigare delade de fält
         # och skrev över varandra ("Nattläge" åt upp filnamnet, osv.)
-        self.info_lbl = tk.Label(row, text="", bg=PAPER, fg=FAINT,
-                                 font=self.sf(9, "italic"))
-        self.info_lbl.pack(side="left", padx=(4, 0))
         self.cmp_btn = self._chip(row, "Håll: original", None)
         self.cmp_btn.pack(side="right")
         self.cmp_btn.bind("<ButtonPress-1>", self._show_original)
         self.cmp_btn.bind("<ButtonRelease-1>", self._show_graded)
         self.adj_btn = self._chip(row, "Justera  ▲", self._toggle_adjust)
         self.adj_btn.pack(side="right", padx=10)
+        # packas SIST: pack ger utrymme i packordning, så när raden är för
+        # smal (långt filnamn, smalt fönster) är det info-texten som kortas —
+        # förut trycktes Justera-knappen ihop till "tera"
+        self.info_lbl = tk.Label(row, text="", bg=PAPER, fg=FAINT,
+                                 font=self.sf(9, "italic"), anchor="w")
+        self.info_lbl.pack(side="left", padx=(4, 0), fill="x", expand=True)
 
         strip_wrap = tk.Frame(bottom, bg=PAPER, height=CARD_IMG_H + 46)
         strip_wrap.pack(fill="x")
@@ -1827,7 +2360,12 @@ class App(tk.Tk):
         self._mark_card("original")
 
         # ---- fotovägg (mitten) ----
-        self.canvas = tk.Canvas(self, bg=WALL, highlightthickness=0, bd=0)
+        # width/height=1: canvasen fyller ändå allt ledigt utrymme (expand),
+        # men dess STANDARDBEGÄRAN (7 cm, vid 200 % DPI ~530 px) fick pack att
+        # klämma bort den sist packade widgeten — beskärningsraden — när
+        # fönstret inte rymde allt
+        self.canvas = tk.Canvas(self, bg=WALL, highlightthickness=0, bd=0,
+                                width=1, height=1)
         self.canvas.pack(fill="both", expand=True, side="top")
         self.canvas.create_text(0, 0, text="Öppna ett foto för att börja",
                                  fill=INK2, font=self.sf(13, "italic"),
@@ -1837,6 +2375,14 @@ class App(tk.Tk):
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Double-Button-1>", self._reset_zoom)
         self.canvas.bind("<MouseWheel>", self._on_zoom)
+        # panorera genom att hålla ner mittenknappen (skrollhjulet) —
+        # alternativ till vänsterklick-drag, som i galleriläge (ozoomat)
+        # redan är upptagen av "håll för original". Knappnumret är
+        # plattformsberoende (se mouse_buttons).
+        mid = MIDDLE_BTN[-2]
+        self.canvas.bind(MIDDLE_BTN, self._on_pan_press)
+        self.canvas.bind(f"<B{mid}-Motion>", self._on_canvas_motion)
+        self.canvas.bind(f"<ButtonRelease-{mid}>", self._on_canvas_release)
         self.canvas.bind(
             "<Configure>",
             lambda e: self.canvas.coords("hint", e.width / 2, e.height / 2))
@@ -1854,6 +2400,9 @@ class App(tk.Tk):
                               highlightthickness=1, highlightbackground=LINE,
                               bd=0)
         self.hist.pack(fill="x", pady=(0, 8))
+        self._hist_arr = None       # senaste bilden, för omritning vid resize
+        self.hist.bind("<Configure>", lambda e: self._update_histogram(
+            self._hist_arr, force=True))
 
         # verktyg: auto · pipett · beskär
         trow = tk.Frame(pad, bg=PAPER2)
@@ -1993,8 +2542,11 @@ class App(tk.Tk):
                      highlightbackground=ACCENT if primary else LINE)
         b._base = (bg, fg)
         b._primary = primary
+        b._disabled = False
         if cmd:
-            b.bind("<Button-1>", lambda e: cmd())
+            # en inaktiverad knapp ska inte göra något — förut ändrade
+            # _set_enabled bara färgen och kommandot kördes ändå
+            b.bind("<Button-1>", lambda e: None if b._disabled else cmd())
         b.bind("<Enter>", lambda e: (not getattr(b, "_disabled", False))
                and b.configure(bg=ACCENT_HI if primary else PAPER))
         b.bind("<Leave>", lambda e: b.configure(bg=b._base[0]))
@@ -2057,7 +2609,7 @@ class App(tk.Tk):
         name.pack(fill="x")
         for w in (outer, inner, img_lbl, name):
             w.bind("<Button-1>", lambda e, k=key: self.select_film(k))
-            w.bind("<Button-3>", lambda e, k=key: self._delete_preset(k))
+            w.bind(RIGHT_BTN, lambda e, k=key: self._delete_preset(k))
             w.bind("<MouseWheel>", self._wheel_strip)
             w.bind("<Enter>", lambda e, k=key: self._card_hover(k, True))
             w.bind("<Leave>", lambda e, k=key: self._card_hover(k, False))
@@ -2088,7 +2640,7 @@ class App(tk.Tk):
         base = os.path.splitext(os.path.basename(path))[0]
         return base if len(base) <= maxlen else base[:maxlen - 1] + "…"
 
-    def _make_roll_card(self, item):
+    def _make_roll_card(self, item, count=True):
         outer = tk.Frame(self.roll_inner, bg=PAPER, padx=3, pady=3)
         outer.pack(side="left", padx=4)
         inner = tk.Frame(outer, bg=MAT, highlightthickness=1,
@@ -2112,7 +2664,7 @@ class App(tk.Tk):
             w.bind("<MouseWheel>", self._wheel_roll)
         self._roll_cards[item.uid] = {"outer": outer, "inner": inner,
                                       "img": img_lbl, "name": name}
-        self._update_roll_card(item)
+        self._update_roll_card(item, count)
 
     # ---------- foto-rulle: dra för att ändra ordning ----------
     def _roll_press(self, e, uid):
@@ -2198,16 +2750,37 @@ class App(tk.Tk):
             if c:
                 c["outer"].pack(side="left", padx=4)
 
-    def _update_roll_card(self, item):
+    @staticmethod
+    def _edit_sig(edit):
+        """Hashbar signatur av ett recept — avgör om en cachad rendering
+        fortfarande gäller."""
+        return (edit.film_key, tuple(sorted(edit.adjust.items())),
+                edit.grain_size, edit.grain_rough, edit.strength,
+                tuple(edit.crop), edit.angle,
+                _curve_key(edit.curve) if edit.curve else None)
+
+    def _roll_thumb_image(self, item):
+        """Rendera ett rullkorts tumnagel (hela pipelinen på 240 px-källan)."""
+        base = apply_geometry(item.thumb_src, item.edit.crop, item.edit.angle)
+        graded = process(base, grade_from_edit(item.edit))
+        arr = blend_strength(base, graded, item.edit.strength / 100.0)
+        pil = ImageOps.fit(to_pil(arr), (ROLL_W, ROLL_H), Image.LANCZOS)
+        return ImageTk.PhotoImage(pil, master=self)
+
+    def _update_roll_card(self, item, count=True):
         c = self._roll_cards.get(item.uid)
         if not c:
             return
-        base = apply_geometry(item.thumb_src, item.edit.crop, item.edit.angle)
-        g = grade_from_edit(item.edit)
-        graded = process(base, g)
-        arr = blend_strength(base, graded, item.edit.strength / 100.0)
-        pil = ImageOps.fit(to_pil(arr), (ROLL_W, ROLL_H), Image.LANCZOS)
-        tkimg = ImageTk.PhotoImage(pil)
+        # rendera bara om receptet ändrats sedan förra renderingen — ångra/
+        # gör om, "Synka → alla" och tembyte rev och renderade förut om
+        # ALLA kort (40 foton ≈ 0.5 s frys vid varje ångra)
+        sig = self._edit_sig(item.edit)
+        cached = self._roll_img_cache.get(item.uid)
+        if cached and cached[0] == sig:
+            tkimg = cached[1]
+        else:
+            tkimg = self._roll_thumb_image(item)
+            self._roll_img_cache[item.uid] = (sig, tkimg)
         c["img"].configure(image=tkimg)
         c["img"]._keep = tkimg       # håll referens (annars GC:as bilden)
         short = self._short_name(item.path)
@@ -2219,7 +2792,8 @@ class App(tk.Tk):
         c["name"].configure(text=prefix + short, fg=color)
         border, bw = self._roll_border(item)
         c["inner"].configure(highlightbackground=border, highlightthickness=bw)
-        self._refresh_roll_count()
+        if count:                    # batchanrop räknar EN gång på slutet
+            self._refresh_roll_count()
 
     def _roll_border(self, item):
         """Kantfärg+tjocklek för ett rullkort: jämförelsemålet (senapsgul,
@@ -2291,6 +2865,9 @@ class App(tk.Tk):
         if not paths:
             self.name_lbl.configure(text="Inga bildfiler att importera")
             return
+        if self._importing:    # kolla FÖRE ångra-snapshoten (annars ett
+            self.name_lbl.configure(text="Import pågår redan — vänta")
+            return             # tomt ångra-steg för en import som aldrig sker)
         self._push_undo()      # så en import kan ångras (no-op om rullen tom)
         self._start_import([(p, None) for p in paths])
 
@@ -2312,25 +2889,19 @@ class App(tk.Tk):
                          args=(list(jobs),)).start()
 
     def _import_worker(self, jobs):
+        """Arbetartråd: läser en förhandsvisning per fil (inget Tk rörs här).
+        Fullupplösningen hålls INTE i RAM — den läses om från disk vid
+        Spara/Exportera — så importen behöver bara förhandsvisningen, som
+        `load_preview` tar fram 3–6× snabbare än en full avkodning."""
         n = len(jobs)
         for i, (path, meta) in enumerate(jobs):
             try:
-                arr = load_rgb(path)
-                # fullupplösningen hålls INTE i RAM — laddas om från disk
-                # vid Spara/Exportera. Preview/thumb behöver inte fullt
-                # bitdjup, så de skalas ner via en 8-bitars PIL-bild.
-                h, w = arr.shape[:2]
-                full_pil = to_pil(arr)
-                prev = full_pil.copy()
-                prev.thumbnail((PREVIEW_MAX, PREVIEW_MAX), Image.LANCZOS)
-                th = full_pil.copy()
-                th.thumbnail((THUMB_SRC, THUMB_SRC), Image.LANCZOS)
-                self._iq.put(("photo", path,
-                              np.asarray(prev, np.float32) / 255.0,
-                              np.asarray(th, np.float32) / 255.0,
-                              w, h, meta))
+                prev, w, h = load_preview(path)
+                self._iq.put(("photo", make_photo_item(path, prev, w, h),
+                              meta))
             except Exception as e:  # noqa: BLE001 — hoppa över trasig fil,
-                self._iq.put(("fail", str(e)))   # men BEHÅLL orsaken
+                log_error(f"import {path}")          # men BEHÅLL orsaken
+                self._iq.put(("fail", str(e) or type(e).__name__))
             self._iq.put(("prog", i + 1, n))
         self._iq.put(("idone",))
 
@@ -2341,9 +2912,7 @@ class App(tk.Tk):
                 msg = self._iq.get_nowait()
                 kind = msg[0]
                 if kind == "photo":
-                    _, path, prev, th, w, h, meta = msg
-                    item = PhotoItem(path=path, prev_arr=prev, thumb_src=th,
-                                     w=w, h=h)
+                    _, item, meta = msg
                     if meta is not None:
                         item.edit, item.rating = meta
                     self.session.append(item)
@@ -2353,6 +2922,10 @@ class App(tk.Tk):
                     self._set_enabled(self.savesess_btn, True)
                     if self.active_idx is None:
                         self._activate(len(self.session) - 1)
+                    else:
+                        # info-raden visade annars "(1/1)" efter en import
+                        # av flera foton — totalen sattes bara vid aktivering
+                        self._update_info()
                 elif kind == "fail":
                     self._imp_failed += 1
                     if len(msg) > 1 and msg[1] and self._imp_err is None:
@@ -2415,7 +2988,7 @@ class App(tk.Tk):
                 continue
             pil = ImageOps.fit(to_pil(process(src, g)),
                                (CARD_W, CARD_IMG_H), Image.LANCZOS)
-            tkimg = ImageTk.PhotoImage(pil)
+            tkimg = ImageTk.PhotoImage(pil, master=self)
             self._thumbs[key] = tkimg
             try:
                 card["img"].configure(image=tkimg)
@@ -2426,8 +2999,8 @@ class App(tk.Tk):
 
     def _cycle_film(self, step):
         keys = [f[0] for f in FILMS]
-        i = (keys.index(self.film_key) + step) % len(keys)
-        self.select_film(keys[i])
+        cur = keys.index(self.film_key) if self.film_key in keys else 0
+        self.select_film(keys[(cur + step) % len(keys)])
 
     # ---------- foto-rulle: aktivt foto & dess redigeringstillstånd ----------
     def _ui_edit_state(self):
@@ -2454,9 +3027,10 @@ class App(tk.Tk):
         self._update_roll_card(item)
 
     def _load_edit_into_ui(self, edit):
-        self.film_key = edit.film_key
+        entry = film_entry(edit.film_key)     # raderad preset → Original
+        self.film_key = entry[0]
         self._mark_card(self.film_key)
-        self.film_name.configure(text=FILM_BY_KEY[self.film_key][1])
+        self.film_name.configure(text=entry[1])
         for k, s in self.sliders.items():
             s.set(edit.adjust.get(k, 0.0))
         self.gsize.set(edit.grain_size)
@@ -2470,10 +3044,15 @@ class App(tk.Tk):
     def _activate(self, idx):
         if not (0 <= idx < len(self.session)):
             return
+        if self._crop_mode:
+            # en väntande (ej tillämpad) beskärning hör till det FÖRRA fotot.
+            # Utan detta låg läget kvar och "Klar" applicerade den rutan på
+            # det nya fotot, medan canvasen fortfarande visade det gamla.
+            self._exit_crop()
         self._sync_ui_to_active()      # spara det förra fotots ändringar
         self.active_idx = idx
         item = self.session[idx]
-        self.prev_arr = item.prev_arr
+        self.prev_arr = as_float01(item.prev_arr)   # uint8 → float, bara aktivt
         self.thumb_src = item.thumb_src
         self.src_path = item.path
         self.zoom = 1.0
@@ -2525,18 +3104,25 @@ class App(tk.Tk):
         if new != self.active_idx:
             self._activate(new)
 
+    def _reset_grain_to_film(self):
+        """Kornstorlek/-struktur till FILMENS egna värden (Tri-X 1.6, en
+        sparad presets inbakade korn) — inte alltid 1.5/0."""
+        g = film_entry(self.film_key)[3]
+        self.gsize.set(g.grain_size)
+        self.grough.set(g.grain_rough)
+
     def select_film(self, key):
         if key == self.film_key:
             self.reset_adjust()       # klick på vald film = nollställ look
             return
+        entry = film_entry(key)
         self._push_undo()
-        self.film_key = key
-        self._mark_card(key)
-        self.film_name.configure(text=FILM_BY_KEY[key][1])
+        self.film_key = entry[0]
+        self._mark_card(self.film_key)
+        self.film_name.configure(text=entry[1])
         for s in self.sliders.values():
             s.reset()
-        self.gsize.set(DEFAULT_GS)
-        self.grough.set(0)
+        self._reset_grain_to_film()
         self.curve_ed.reset()     # dokumenterat: "nollställs när du byter
         self.strength.set(100)    # film" — tonkurvan är en del av looken
         self.intensity = 1.0
@@ -2546,16 +3132,24 @@ class App(tk.Tk):
         self._push_undo()
         for s in self.sliders.values():
             s.reset()
-        self.gsize.set(DEFAULT_GS)
-        self.grough.set(0)
+        self._reset_grain_to_film()
         self.curve_ed.reset()
         self._request_render()
 
     # ---------------------------------------------------------- histogram
-    def _update_histogram(self, arr):
+    def _update_histogram(self, arr, force=False):
+        if not force:
+            self._hist_arr = arr    # cacha senaste bilden för <Configure>-omritning
         c = self.hist
-        w = int(c["width"])
-        hgt = int(c["height"])
+        # FAKTISK bredd, inte den vid-konstruktion konfigurerade — panelen
+        # packar canvasen med fill="x", så den stretchar bredare än de
+        # ursprungliga 224px och c["width"] skulle bara rita en smal remsa
+        # i vänsterkanten av den bredare rutan (samma klass av bugg som
+        # Track._width/CurveEditor._dims skyddar mot på andra håll).
+        w = c.winfo_width()
+        w = w if w > 4 else int(c["width"])
+        hgt = c.winfo_height()
+        hgt = hgt if hgt > 4 else int(c["height"])
         c.delete("all")
         if arr is None:
             return
@@ -2566,13 +3160,9 @@ class App(tk.Tk):
         for i in range(3):
             hval, _ = np.histogram(small[..., i], bins=bins, range=(0, 1))
             chans.append(hval)
-        # robust normalisering: rena svart/vit-spikar (yttersta binnarna) kan
-        # bli många gånger högre än resten och skulle annars trycka ner hela
-        # kurvan. Sätt taket från de inre binnarna och klipp det som spiller
-        # över, så mittonerna fyller ut rutan.
-        interior = np.concatenate([h[1:-1] for h in chans]) if bins > 2 \
-            else np.concatenate(chans)
-        peak = max(1, int(interior.max()))
+        # robust normalisering (se _hist_peak) + klipp det som spiller över,
+        # så mittonerna fyller ut rutan
+        peak = _hist_peak(chans)
         cols = ("#b06a5f", "#5f8a5c", "#5f79a8")   # dämpad r/g/b
         for hval, col in zip(chans, cols):
             pts = [1, hgt - 1]
@@ -2659,23 +3249,38 @@ class App(tk.Tk):
         save_user_presets()
         self.name_lbl.configure(
             text=f"Preset '{name.strip()}' sparad — högerklick tar bort")
+        return key
 
     def _delete_preset(self, key):
-        """Högerklick på ett eget preset-kort tar bort det. Foton i rullen
-        som använder presetens faller tillbaka på Original."""
+        """Högerklick på ett eget preset-kort tar bort det (efter bekräftelse
+        — raderingen går inte att ångra, och ett felklick raderade förut en
+        look direkt). Foton i rullen, i ångra-/gör om-historiken och i
+        urklippet som använder preseten faller tillbaka på Original; att
+        bara uppdatera rullen gav KeyError vid nästa ångra."""
         if not key.startswith("user_") or key not in FILM_BY_KEY:
             return
-        self._sync_ui_to_active()
         label = FILM_BY_KEY[key][1]
+        if not self._confirm("Ta bort preset",
+                             f"Ta bort preseten '{label}' permanent?"):
+            return
+        self._sync_ui_to_active()
         for it in self.session:
             if it.edit.film_key == key:
                 it.edit.film_key = "original"
-                self._update_roll_card(it)
+                self._update_roll_card(it, count=False)
+        for snap in self._undo + self._redo:
+            for e in snap["edits"].values():
+                if e.film_key == key:
+                    e.film_key = "original"
+        if self._clipboard_edit and self._clipboard_edit.film_key == key:
+            self._clipboard_edit.film_key = "original"
         entry = FILM_BY_KEY.pop(key)
         FILMS.remove(entry)
         card = self._cards.pop(key, None)
         if card:
             card["outer"].destroy()
+        self._thumbs.pop(key, None)
+        self._refresh_roll_count()
         save_user_presets()
         if self.film_key == key:
             self.film_key = "original"
@@ -2784,8 +3389,10 @@ class App(tk.Tk):
         self._undo, self._redo = undo, redo
         self._clipboard_edit, self._session_path = clip, spath
         self._compare_uid = cmp_uid
-        for item in self.session:
-            self._make_roll_card(item)
+        self._crop_src_ref = self._crop_img_key = None   # canvasen är ny
+        self._cmp_disp = None
+        for item in self.session:            # tumnaglar ur cachen — ingen
+            self._make_roll_card(item, count=False)   # omrendering
         self._refresh_roll_count()
         if self.session:
             self._set_enabled(self.export_btn, True)
@@ -2830,18 +3437,37 @@ class App(tk.Tk):
         else:
             for w in top:
                 w.pack(fill="x", side="top", before=self.canvas)
-            self._bottom.pack(fill="x", side="bottom")
-        self.after(40, lambda: self._draw_compare() if self._compare_mode
-                   else self._draw(self._view_pil))
+            # tillbaka på SIN plats i pack-ordningen (före beskärningsraden/
+            # canvasen) — packad sist hamnade den fel och klämdes först
+            anchor = self.crop_bar if self.crop_bar.winfo_manager() \
+                else self.canvas
+            self._bottom.pack(fill="x", side="bottom", before=anchor)
+        # samma omritning som vid fönsterändring — den väljer rätt vy för
+        # läget. Förut ritades alltid gallerivyn, även i beskärningsläge
+        # (rutan och handtagen försvann under en vanlig bild).
+        self.after(40, self._resize_redraw)
 
     # ---------------------------------------------------------- jämförelse
     def _render_item_preview(self, item):
         """Rendera ett rull-fotos look i förhandsvisningsupplösning (för
         jämförelsevyn — engångsberäkning, inte via bakgrundstråden)."""
-        base = apply_geometry(item.prev_arr, item.edit.crop, item.edit.angle)
+        base = apply_geometry(as_float01(item.prev_arr), item.edit.crop,
+                              item.edit.angle)
         graded = process(base, grade_from_edit(item.edit))
         arr = blend_strength(base, graded, item.edit.strength / 100.0)
         return to_pil(arr)
+
+    def _compare_image(self, item):
+        """Jämförelsefotot renderat — CACHAT på receptets signatur. Det
+        renderades förut om synkront vid VARJE compose, dvs. vid varje
+        reglagedrag på vänsterbilden, fast högerbilden inte kan ändras
+        medan man jämför (uppmätt: 123 → 25 ms per bildruta)."""
+        sig = self._edit_sig(item.edit)
+        c = self._cmp_cache
+        if c is None or c[0] != item.uid or c[1] != sig:
+            self._cmp_cache = c = (item.uid, sig,
+                                   self._render_item_preview(item))
+        return c[2]
 
     def toggle_compare(self):
         if self._compare_mode:
@@ -2915,17 +3541,25 @@ class App(tk.Tk):
         for i, (item, tag) in enumerate(((act, "aktiv"), (comp, "jämför"))):
             if i == 0 and self.cur_pil is not None:
                 pil = self.cur_pil          # aktiv är redan renderad
-            else:
+            elif i == 0:
                 pil = self._render_item_preview(item)
+            else:
+                pil = self._compare_image(item)     # cachad (se metoden)
             iw, ih = pil.size
             margin, mat = 28, 12
             avail_w = max(1, colw - 2 * (margin + mat))
             avail_h = max(1, ch - 2 * (margin + mat) - 24)
             s = min(avail_w / iw, avail_h / ih, 1.0)
             dw, dh = max(1, int(iw * s)), max(1, int(ih * s))
-            disp = pil.resize((dw, dh), Image.LANCZOS) \
-                if (dw, dh) != (iw, ih) else pil
-            tkimg = ImageTk.PhotoImage(disp)
+            key = (item.uid, self._cmp_cache[1] if i else None, dw, dh)
+            if i == 1 and self._cmp_disp and self._cmp_disp[0] == key:
+                tkimg = self._cmp_disp[1]           # även skalningen cachas
+            else:
+                disp = pil.resize((dw, dh), Image.LANCZOS) \
+                    if (dw, dh) != (iw, ih) else pil
+                tkimg = ImageTk.PhotoImage(disp, master=self)
+                if i == 1:
+                    self._cmp_disp = (key, tkimg)
             self._cmp_imgs.append(tkimg)
             cx = int(colw * i + colw / 2)
             cy = ch // 2 - 6
@@ -2970,8 +3604,10 @@ class App(tk.Tk):
 
     def _adj_drag_move(self, e):
         gx, gy, bx, by = self._adj_grab
-        pw = self.adjust.winfo_width() or self.adjust.winfo_reqwidth()
-        ph = self.adjust.winfo_height() or self.adjust.winfo_reqheight()
+        pw = self.adjust.winfo_width()        # 1 (inte 0) om omappad —
+        pw = pw if pw > 4 else self.adjust.winfo_reqwidth()   # "1 or X"-fällan
+        ph = self.adjust.winfo_height()
+        ph = ph if ph > 4 else self.adjust.winfo_reqheight()
         nx = _clampf(bx + (e.x_root - gx), 4, max(4, self.winfo_width() - pw - 4))
         ny = _clampf(by + (e.y_root - gy), 4,
                      max(4, self.winfo_height() - ph - 4))
@@ -3024,11 +3660,11 @@ class App(tk.Tk):
                     self._compose()
             self._drain_batch()
             self._drain_import()
-        except Exception:      # noqa: BLE001 — loopen får aldrig dö
-            pass
+        except Exception:      # noqa: BLE001 — loopen får aldrig dö …
+            log_error("poll")  # … men felet får inte heller försvinna tyst
         finally:
             try:
-                self.after(30, self._poll_render)
+                self._poll_after = self.after(30, self._poll_render)
             except Exception:      # noqa: BLE001 — appen håller på att stängas
                 pass
 
@@ -3072,7 +3708,7 @@ class App(tk.Tk):
             dw, dh = max(1, int(iw * base)), max(1, int(ih * base))
             disp = pil_img.resize((dw, dh), Image.LANCZOS) \
                 if (dw, dh) != (iw, ih) else pil_img
-            self._tk_img = ImageTk.PhotoImage(disp)
+            self._tk_img = ImageTk.PhotoImage(disp, master=self)
             x0, y0 = (cw - dw) // 2, (ch - dh) // 2
             self._img_rect = (x0, y0, base)
             self.canvas.create_rectangle(
@@ -3105,7 +3741,8 @@ class App(tk.Tk):
         dh = max(1, int((sy1 - sy0) * s))
         # BILINEAR medan man drar/zoomar (mjukt), LANCZOS när det står stilla
         rs = Image.BILINEAR if self._fast_view else Image.LANCZOS
-        self._tk_img = ImageTk.PhotoImage(crop.resize((dw, dh), rs))
+        self._tk_img = ImageTk.PhotoImage(crop.resize((dw, dh), rs),
+                                          master=self)
         self.canvas.create_image(int(X + sx0 * s), int(Y + sy0 * s),
                                  anchor="nw", image=self._tk_img, tags="art")
         self.canvas.create_text(
@@ -3121,7 +3758,7 @@ class App(tk.Tk):
         iw, ih = self._view_pil.size
         base = self._base_scale(cw, ch, iw, ih)
         old = self.zoom
-        new = _clampf(old * (1.0015 ** e.delta), 1.0, 8.0)
+        new = _clampf(old * (1.0015 ** wheel_units(e.delta)), 1.0, 8.0)
         if abs(new - old) < 1e-4:
             return
         # håll punkten under muspekaren stilla
@@ -3169,7 +3806,9 @@ class App(tk.Tk):
         self._crop_angle = self._cur_angle
         self._crop_aspect = None
         self.straight.set(self._cur_angle)
-        self.crop_bar.pack(fill="x", side="bottom")
+        # before=canvas: raden får sin plats FÖRE canvasen i pack-ordningen,
+        # så det är canvasen (inte Klar/Avbryt) som krymper när utrymmet tar slut
+        self.crop_bar.pack(fill="x", side="bottom", before=self.canvas)
         # crop_bar stjäl höjd från canvasen — utan update_idletasks() läser
         # _draw_crop() (via _crop_tf) canvasens GAMLA storlek eftersom pack-
         # layouten inte hunnit räkna om än, vilket ritade en beskärningsruta
@@ -3231,16 +3870,31 @@ class App(tk.Tk):
         dw, dh = int(iw * scale), int(ih * scale)
         return (cw - dw) // 2, (ch - dh) // 2, dw, dh
 
+    def _crop_display(self):
+        """Den rätade helbilden för beskärningsvyn — CACHAD per (källa,
+        vinkel). Rotationen (bikubisk, per kanal, 1400 px) räknades förut om
+        vid VARJE musrörelse när man drog i beskärningsrutan: ~140 ms per
+        rörelse för ett uprätat foto, fast bara rutan ändrades."""
+        key = round(self._crop_angle, 4)
+        ref = self._crop_src_ref
+        if ref is None or ref[0] is not self.prev_arr or ref[1] != key:
+            self._crop_disp = to_pil(apply_geometry(self.prev_arr, NO_CROP,
+                                                    self._crop_angle))
+            self._crop_src_ref = (self.prev_arr, key)
+            self._crop_img_key = None
+        return self._crop_disp
+
     def _draw_crop(self):
-        self._crop_disp = to_pil(apply_geometry(self.prev_arr, NO_CROP,
-                                                self._crop_angle))
+        self._crop_display()
         self.canvas.delete("art")
         self.canvas.delete("crop")
         x0, y0, dw, dh = self._crop_tf()
         if dw < 2 or dh < 2:              # canvasen inte layoutad än
             return
-        self._crop_dispimg = ImageTk.PhotoImage(
-            self._crop_disp.resize((dw, dh), Image.BILINEAR))
+        if self._crop_img_key != (dw, dh):    # skala bara om vid ny storlek
+            self._crop_dispimg = ImageTk.PhotoImage(
+                self._crop_disp.resize((dw, dh), Image.BILINEAR), master=self)
+            self._crop_img_key = (dw, dh)
         self.canvas.create_image(x0, y0, anchor="nw", image=self._crop_dispimg,
                                  tags="crop")
         rx0 = x0 + self._crop_rect[0] * dw
@@ -3311,6 +3965,8 @@ class App(tk.Tk):
             return
         mode, corner, sx, sy, start = self._crop_drag
         x0, y0, dw, dh = self._crop_tf()
+        if dw < 2 or dh < 2:
+            return
         ndx = (e.x - sx) / dw
         ndy = (e.y - sy) / dh
         r = list(start)
@@ -3337,10 +3993,25 @@ class App(tk.Tk):
         self._draw_crop()
 
     def _apply_ratio_to_corner(self, corner):
-        """Justera höjden efter bredden (kring den fasta hörnankaren) så att
-        låst förhållande hålls under hörndrag."""
+        """Håll låst förhållande under drag. Hörn och vänster/höger-kant:
+        höjden följer bredden (kring den fasta ankaren). Topp/botten-kant:
+        BREDDEN följer höjden, centrerat — förut räknades höjden tillbaka ur
+        den oförändrade bredden, så de handtagen gjorde ingenting alls."""
         nr = self._norm_ratio()
         x0, y0, x1, y1 = self._crop_rect
+        if corner in ("n", "s"):
+            h = y1 - y0
+            w = h * nr
+            if w > 1.0:                # får inte plats på bredden
+                w = 1.0
+                h = w / nr
+                if corner == "n":
+                    y0 = y1 - h
+                else:
+                    y1 = y0 + h
+            x0 = _clampf((x0 + x1) / 2 - w / 2, 0.0, 1.0 - w)
+            self._crop_rect = [x0, y0, x0 + w, y1]
+            return
         w = x1 - x0
         h = w / nr
         if "n" in corner:      # övre kanten rör sig → ankare = nedre
@@ -3371,6 +4042,7 @@ class App(tk.Tk):
     def _exit_crop(self):
         self._crop_mode = False
         self._crop_drag = None
+        self._crop_src_ref = self._crop_img_key = None   # släpp cachen
         self.canvas.delete("crop")
         self.crop_bar.pack_forget()
 
@@ -3386,6 +4058,17 @@ class App(tk.Tk):
         else:                                 # klick-håll = jämför original
             self._panning = False
             self._show_original()
+
+    def _on_pan_press(self, e):
+        """Mittenknappen (skrollhjulet nedtryckt) börjar alltid panorera,
+        oavsett zoomnivå — till skillnad från vänsterklick är den inte
+        upptagen av "håll för original" i galleriläge. Utan zoom har
+        panoreringen ingen synlig effekt (helbilden visas redan centrerad),
+        men blir aktiv så fort man zoomar in."""
+        if self._compare_mode or self._crop_mode:
+            return
+        self._panning = True
+        self._pan_start = (e.x, e.y, self.pan_x, self.pan_y)
 
     def _on_canvas_motion(self, e):
         if self._compare_mode:
@@ -3486,6 +4169,8 @@ class App(tk.Tk):
     def _set_export_fmt(self, fmt):
         self.export_fmt = fmt
         self._mark_export_fmt()
+        self._settings["export_fmt"] = fmt      # minns till nästa körning
+        save_settings(self._settings)
         self.name_lbl.configure(text=f"Exportformat: {fmt}")
 
     def _mark_export_fmt(self):
@@ -3498,6 +4183,25 @@ class App(tk.Tk):
 
     def _on_quality(self):
         self.jpeg_quality = int(round(self.qtrack.get()))
+        self._settings["jpeg_quality"] = self.jpeg_quality   # minns …
+        self._save_settings_soon()     # … men skrivs inte per musrörelse
+
+    def _save_settings_soon(self, delay=600):
+        """Debouncad skrivning av settings-filen. Kvalitetsreglaget anropade
+        förut save_settings vid VARJE drag-händelse — dussintals fil-
+        skrivningar per sekund från GUI-tråden."""
+        if self._settings_after:
+            self.after_cancel(self._settings_after)
+        self._settings_after = self.after(delay, self._flush_settings)
+
+    def _flush_settings(self):
+        if self._settings_after:
+            try:
+                self.after_cancel(self._settings_after)
+            except Exception:      # noqa: BLE001
+                pass
+            self._settings_after = None
+        save_settings(self._settings)
 
     def _ew_drag_press(self, e):
         self._ew_grab = (e.x_root, e.y_root, self._ew_x, self._ew_y)
@@ -3508,42 +4212,30 @@ class App(tk.Tk):
         self._ew_y = _clampf(by + (e.y_root - gy), 4, self.winfo_height() - 60)
         self.exportwin.place(x=self._ew_x, y=self._ew_y, anchor="nw")
 
-    def _save_pil(self, pil, path):
-        """Skriv en PIL-bild med format ur filändelsen. JPEG = vald kvalitet,
-        PNG/TIFF = förlustfritt (TIFF LZW-komprimerad)."""
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".png":
-            pil.save(path)
-        elif ext in (".tif", ".tiff"):
-            pil.save(path, compression="tiff_lzw")
-        else:
-            pil.save(path, quality=int(self.jpeg_quality), subsampling=0)
-
     # ---------------------------------------------------------- spara
     def save_image(self):
         if getattr(self.save_btn, "_disabled", True) or self.src_path is None:
             return
         base = os.path.splitext(os.path.basename(self.src_path))[0] \
-            + "_" + self.film_key
+            + "_" + film_slug(self.film_key)
         de = self.EXT_MAP.get(self.export_fmt, ".jpg")
         path = filedialog.asksaveasfilename(
             title="Spara bild", defaultextension=de, initialfile=base,
             filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png"),
                        ("TIFF", "*.tif")])
-        if not path:
+        if path:
+            self._save_to(path)
+
+    def _save_to(self, path):
+        """Spara aktivt foto i full upplösning till `path` — i BAKGRUNDEN via
+        samma arbetartråd som Exportera alla. Förut renderades det synkront
+        på GUI-tråden och appen frös i flera sekunder per sparning."""
+        if self._exporting or self.active_idx is None:
             return
-        self.name_lbl.configure(text="Renderar fullupplösning …")
-        self.update_idletasks()
-        try:
-            full = load_rgb(self.src_path)
-            full = apply_geometry(full, self._cur_crop, self._cur_angle)
-            graded = process(full, self._effective_grade())
-            arr = blend_strength(full, graded, self.intensity)
-            self._save_pil(to_pil(arr), path)
-        except Exception as e:      # noqa: BLE001
-            self.name_lbl.configure(text=f"Kunde inte spara: {e}")
-            return
-        self.name_lbl.configure(text=f"Sparad ▸ {os.path.basename(path)}")
+        self._sync_ui_to_active()
+        item = self.session[self.active_idx]
+        self.name_lbl.configure(text="Sparar fullupplösning …")
+        self._start_export([self._export_job(item, out=path)], single=True)
 
     # ---------------------------------------------------------- session-verktyg
     def copy_settings(self):
@@ -3559,7 +4251,9 @@ class App(tk.Tk):
             return
         self._push_undo()
         self._load_edit_into_ui(self._clipboard_edit.clone())
-        self._request_render()
+        # beskärning/vinkel ingår i receptet — räkna om geometrin, annars
+        # syntes den inklistrade beskärningen först efter ett fotobyte
+        self._apply_geo()
 
     def sync_active_to_all(self):
         """Applicera det AKTIVA fotots look på alla foton i rullen
@@ -3573,7 +4267,8 @@ class App(tk.Tk):
         src = self.session[self.active_idx].edit.clone()
         for item in self.session:
             item.edit = src.clone()
-            self._update_roll_card(item)
+            self._update_roll_card(item, count=False)
+        self._refresh_roll_count()
         self.name_lbl.configure(
             text=f"Alla {len(self.session)} foton synkade till aktuell look")
 
@@ -3581,32 +4276,60 @@ class App(tk.Tk):
         """Ta bort aktivt foto ur rullen (rör inte filen på disk)."""
         if self.active_idx is None:
             return
+        if self._crop_mode:
+            self._exit_crop()
         self._push_undo()
         item = self.session.pop(self.active_idx)
         card = self._roll_cards.pop(item.uid, None)
         if card:
             card["outer"].destroy()
         if not self.session:
-            self.active_idx = None
-            self.prev_arr = self.thumb_src = None
-            self.src_path = None
-            self.graded_arr = self.cur_pil = self._view_pil = None
-            self.canvas.delete("art")
-            self.canvas.create_text(
-                0, 0, text="Öppna ett foto för att börja", fill=INK2,
-                font=self.sf(13, "italic"), tags="hint")
-            self.canvas.coords("hint", self.canvas.winfo_width() / 2,
-                               self.canvas.winfo_height() / 2)
-            self._set_enabled(self.save_btn, False)
-            self._set_enabled(self.export_btn, False)
-            self._set_enabled(self.savesess_btn, False)
+            self._clear_active_view()
             self.name_lbl.configure(text="")
-            self._update_info()
         else:
             new_idx = min(self.active_idx, len(self.session) - 1)
             self.active_idx = None      # tvinga _activate ladda om helt
             self._activate(new_idx)
         self._refresh_roll_count()
+
+    def _clear_active_view(self):
+        """Tom rulle: nollställ ALLT som hör till ett aktivt foto. Förut låg
+        geo_arr kvar — mellanslag/klick på canvasen visade då det borttagna
+        fotot igen, och efter "gör om" till en tom rulle stod både bilden
+        och en aktiv Spara-knapp kvar."""
+        if self._crop_mode:
+            self._exit_crop()
+        if self._compare_mode:
+            self._compare_mode = False
+            self._cmp_imgs = []
+            self.compare_btn.configure(bg=self.compare_btn._base[0],
+                                       fg=self.compare_btn._base[1])
+        self.active_idx = None
+        self.prev_arr = self.thumb_src = self.geo_arr = None
+        self._geo_thumb = self._compose_arr = None
+        self.src_path = None
+        self.graded_arr = self.cur_pil = self._view_pil = None
+        self._showing_original = False
+        self._token += 1                  # släng ev. pågående rendering
+        self.canvas.delete("art")
+        self.canvas.delete("hint")
+        self.canvas.create_text(
+            0, 0, text="Öppna ett foto för att börja", fill=INK2,
+            font=self.sf(13, "italic"), tags="hint")
+        self.canvas.coords("hint", self.canvas.winfo_width() / 2,
+                           self.canvas.winfo_height() / 2)
+        self._update_histogram(None)
+        if self._thumb_after:
+            self.after_cancel(self._thumb_after)
+            self._thumb_after = None
+        self._thumb_queue = []
+        for c in self._cards.values():    # filmremsan visade annars kvar
+            c["img"].configure(image=self._blank)   # det borttagna fotot
+        self._thumbs.clear()
+        self._set_enabled(self.save_btn, False)
+        self._set_enabled(self.export_btn, False)
+        self._set_enabled(self.savesess_btn, False)
+        self._update_info()
 
     # ---------------------------------------------------------- ångra/gör om
     def _snapshot(self):
@@ -3621,19 +4344,23 @@ class App(tk.Tk):
         }
 
     def _restore(self, snap):
+        if self._crop_mode:
+            self._exit_crop()
         self.session = list(snap["items"])
         for it in self.session:
             e = snap["edits"].get(it.uid)
             if e is not None:
                 it.edit = e.clone()
             it.rating = snap["ratings"].get(it.uid, it.rating)
-        self._rebuild_roll_cards()
+        self._sync_roll_cards()
         if self.session:
-            idx = max(0, min(snap["active"], len(self.session) - 1))
+            idx = max(0, min(snap.get("active") or 0, len(self.session) - 1))
             self.active_idx = None      # undvik att _activate syncar UI tillbaka
             self._activate(idx)
+            self._set_enabled(self.export_btn, True)
+            self._set_enabled(self.savesess_btn, True)
         else:
-            self.active_idx = None
+            self._clear_active_view()
         self._refresh_roll_count()
 
     def _push_undo(self):
@@ -3649,6 +4376,11 @@ class App(tk.Tk):
         self._set_enabled(self.redo_btn, False)
 
     def undo(self, _=None):
+        if self._importing:
+            # importtråden levererar foton medan den kör — ett ångra mitt i
+            # skulle återställa rullen och sedan få nya foton inskjutna
+            self.name_lbl.configure(text="Vänta tills importen är klar")
+            return
         if not self._undo:
             self.name_lbl.configure(text="Inget att ångra")
             return
@@ -3660,6 +4392,9 @@ class App(tk.Tk):
         self.name_lbl.configure(text="Ångrade senaste ändringen")
 
     def redo(self, _=None):
+        if self._importing:
+            self.name_lbl.configure(text="Vänta tills importen är klar")
+            return
         if not self._redo:
             self.name_lbl.configure(text="Inget att göra om")
             return
@@ -3670,14 +4405,21 @@ class App(tk.Tk):
         self._set_enabled(self.undo_btn, True)
         self.name_lbl.configure(text="Gjorde om ändringen")
 
-    def _rebuild_roll_cards(self):
-        """Riv och bygg om rullens kort utifrån aktuell `self.session`
-        (används av ångra, som kan ändra medlemskapet)."""
-        for c in self._roll_cards.values():
-            c["outer"].destroy()
-        self._roll_cards.clear()
+    def _sync_roll_cards(self):
+        """Gör rullens kort till en spegel av `self.session` (ångra/gör om kan
+        ändra medlemskap, ordning och recept): kort för borttagna foton rivs,
+        saknade skapas, befintliga ÅTERANVÄNDS — och med renderingscachen
+        ritas bara tumnaglar vars recept faktiskt ändrats. Förut revs och
+        renderades alla kort om vid varje ångra."""
+        live = {it.uid for it in self.session}
+        for uid in [u for u in self._roll_cards if u not in live]:
+            self._roll_cards.pop(uid)["outer"].destroy()
         for item in self.session:
-            self._make_roll_card(item)
+            if item.uid in self._roll_cards:
+                self._update_roll_card(item, count=False)
+            else:
+                self._make_roll_card(item, count=False)
+        self._repack_roll_cards()
 
     # ---------------------------------------------------------- exportera alla
     def export_all(self):
@@ -3686,51 +4428,77 @@ class App(tk.Tk):
             return
         self._sync_ui_to_active()      # ta med ev. osparade ändringar
         outdir = filedialog.askdirectory(title="Exportera alla till mapp")
-        if not outdir:
+        if outdir:
+            self._export_to_dir(outdir)
+
+    def _export_to_dir(self, outdir):
+        if self._exporting or not self.session:
             return
-        # hoppa över ratade foton
-        picks = [it for it in self.session if it.rating != -1]
+        self._sync_ui_to_active()
+        picks = [it for it in self.session if it.rating != -1]   # ej ratade
         skipped = len(self.session) - len(picks)
-        jobs = [(item.path, grade_from_edit(item.edit),
-                item.edit.strength / 100.0, item.edit.film_key,
-                item.edit.crop, item.edit.angle)
-               for item in picks]
-        if not jobs:
+        if not picks:
             self.name_lbl.configure(text="Alla foton är ratade — inget att "
                                          "exportera")
             return
-        self._set_enabled(self.export_btn, False)
-        self._set_enabled(self.save_btn, False)
-        self._exporting = True
         ext = self.EXT_MAP.get(self.export_fmt, ".jpg")
         tail = f" ({skipped} ratade hoppas över)" if skipped else ""
         self.name_lbl.configure(
-            text=f"Exporterar {self.export_fmt}: 0/{len(jobs)} …{tail}")
-        threading.Thread(target=self._batch_worker, daemon=True,
-                         args=(jobs, outdir, ext)).start()
+            text=f"Exporterar {self.export_fmt}: 0/{len(picks)} …{tail}")
+        self._start_export([self._export_job(it, outdir=outdir, ext=ext)
+                            for it in picks])
 
-    def _batch_worker(self, jobs, outdir, ext):
+    def _export_job(self, item, out=None, outdir=None, ext=None):
+        """Allt arbetartråden behöver, fryst NU (receptet kan ändras medan
+        exporten pågår). Antingen en exakt utfil (Spara) eller mapp +
+        ändelse (Exportera alla, som väljer ett ledigt filnamn)."""
+        base = (os.path.splitext(os.path.basename(item.path))[0] + "_"
+                + film_slug(item.edit.film_key))
+        return {"src": item.path, "grade": grade_from_edit(item.edit),
+                "k": item.edit.strength / 100.0, "crop": item.edit.crop,
+                "angle": item.edit.angle, "out": out, "outdir": outdir,
+                "ext": ext, "base": base}
+
+    def _start_export(self, jobs, single=False):
+        self._set_enabled(self.export_btn, False)
+        self._set_enabled(self.save_btn, False)
+        self._exporting = True
+        # kvaliteten fryses vid start — ändras reglaget mitt i en export
+        # ska inte halva rullen få en annan kvalitet
+        threading.Thread(target=self._export_worker, daemon=True,
+                         args=(jobs, self.jpeg_quality, single)).start()
+
+    def _export_worker(self, jobs, quality, single):
+        """Arbetartråd för Spara OCH Exportera alla: läser om originalet i
+        full upplösning, applicerar geometri + recept och skriver med
+        källans EXIF/ICC. Felorsaken sparas (visades inte alls förut)."""
         saved = failed = 0
+        first_err = out_name = None
         n = len(jobs)
-        for i, (path, grade, k, film_key, crop, angle) in enumerate(jobs):
+        for i, j in enumerate(jobs):
             try:
-                arr = load_rgb(path)
-                arr = apply_geometry(arr, crop, angle)
-                graded = process(arr, grade)
-                pil = to_pil(blend_strength(arr, graded, k))
-                base = os.path.splitext(os.path.basename(path))[0] \
-                    + "_" + film_key
-                outp = os.path.join(outdir, base + ext)
-                c = 1
-                while os.path.exists(outp):
-                    outp = os.path.join(outdir, f"{base}_{c}{ext}")
-                    c += 1
-                self._save_pil(pil, outp)
+                arr = apply_geometry(load_rgb(j["src"]), j["crop"], j["angle"])
+                graded = process(arr, j["grade"])
+                pil = to_pil(blend_strength(arr, graded, j["k"]))
+                del arr, graded
+                outp = j["out"]
+                if outp is None:
+                    outp = os.path.join(j["outdir"], j["base"] + j["ext"])
+                    c = 1
+                    while os.path.exists(outp):
+                        outp = os.path.join(j["outdir"],
+                                            f"{j['base']}_{c}{j['ext']}")
+                        c += 1
+                save_image_file(pil, outp, quality, read_meta(j["src"]))
                 saved += 1
-            except Exception:      # noqa: BLE001 — hoppa över trasig fil
+                out_name = os.path.basename(outp)
+            except Exception as e:      # noqa: BLE001 — hoppa över trasig fil
                 failed += 1
-            self._bq.put(("prog", i + 1, n, os.path.basename(path)))
-        self._bq.put(("done", saved, failed))
+                log_error(f"export {j['src']}")
+                if first_err is None:
+                    first_err = (str(e) or type(e).__name__)[:90]
+            self._bq.put(("prog", i + 1, n, os.path.basename(j["src"])))
+        self._bq.put(("done", saved, failed, first_err, single, out_name))
 
     def _drain_batch(self):
         try:
@@ -3738,17 +4506,25 @@ class App(tk.Tk):
                 msg = self._bq.get_nowait()
                 if msg[0] == "prog":
                     _, done, total, name = msg
-                    self.name_lbl.configure(
-                        text=f"Exporterar: {done}/{total} · {name}")
+                    if total > 1:
+                        self.name_lbl.configure(
+                            text=f"Exporterar: {done}/{total} · {name}")
                 elif msg[0] == "done":
-                    _, saved, failed = msg
+                    _, saved, failed, err, single, out_name = msg
                     self._exporting = False
                     self._close_warned = False
                     self._set_enabled(self.export_btn, bool(self.session))
                     self._set_enabled(self.save_btn, self.src_path is not None)
-                    extra = f" ({failed} misslyckades)" if failed else ""
-                    self.name_lbl.configure(
-                        text=f"Export klar · {saved} sparade{extra}")
+                    if single:
+                        txt = (f"Sparad ▸ {out_name}" if saved
+                               else "Kunde inte spara")
+                    else:
+                        txt = f"Export klar · {saved} sparade"
+                        if failed:
+                            txt += f" ({failed} misslyckades)"
+                    if failed and err:
+                        txt += f" — {err}"
+                    self.name_lbl.configure(text=txt)
         except queue.Empty:
             pass
 
@@ -3764,21 +4540,37 @@ class App(tk.Tk):
             title="Spara projekt", defaultextension=SESSION_EXT,
             initialfile="projekt" + SESSION_EXT,
             filetypes=[("Filmrulle-projekt", "*" + SESSION_EXT)])
-        if not path:
-            return
+        if path:
+            self._write_session(path)
+
+    def _write_session(self, path):
+        """Skriv projektfilen (atomiskt). Varje foto sparas med både absolut
+        sökväg och sökväg RELATIV till projektfilen — flyttas hela mappen
+        (extern disk, annan dator) hittas fotona ändå."""
+        self._sync_ui_to_active()
+        pdir = os.path.dirname(os.path.abspath(path))
+
+        def rel(p):
+            try:
+                return os.path.relpath(os.path.abspath(p), pdir)
+            except ValueError:          # olika enheter på Windows
+                return None
+
         data = {"version": VERSION, "active": self.active_idx or 0,
                 "photos": [{"path": os.path.abspath(it.path),
+                            "rel": rel(it.path),
                             "edit": it.edit.to_dict(), "rating": it.rating}
                            for it in self.session]}
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=1)
+            _write_json_atomic(path, data)
         except Exception as e:      # noqa: BLE001
+            log_error("save_session")
             self.name_lbl.configure(text=f"Kunde inte spara projekt: {e}")
-            return
+            return False
         self._session_path = path
         self.name_lbl.configure(
             text=f"Projekt sparat ▸ {os.path.basename(path)}")
+        return True
 
     def _load_session_file(self, path):
         """Läs en .filmrulle-projektfil och ladda fotona via den TRÅDADE
@@ -3794,9 +4586,37 @@ class App(tk.Tk):
         except Exception as e:      # noqa: BLE001
             self.name_lbl.configure(text=f"Kunde inte läsa projekt: {e}")
             return
-        if self._compare_mode:         # gamla jämförelse-uid:n blir stallade
-            self._exit_compare()
-        # rensa nuvarande session
+        # TOLKA och VALIDERA allt innan nuvarande rulle rörs — förut rensades
+        # rullen först, så en trasig projektfil gav krasch + tom rulle
+        photos = data.get("photos") if isinstance(data, dict) else None
+        if not isinstance(photos, list):
+            self.name_lbl.configure(text="Ogiltig projektfil")
+            return
+        pdir = os.path.dirname(os.path.abspath(path))
+        jobs = []
+        for p in photos:
+            if not isinstance(p, dict):
+                continue
+            src = _resolve_project_path(p, pdir)
+            if not src:
+                continue
+            r = p.get("rating")
+            r = r if isinstance(r, int) and not isinstance(r, bool) \
+                and r in (-1, 0, 1) else 0
+            jobs.append((src, (EditState.from_dict(p.get("edit")), r)))
+        if not jobs:
+            self.name_lbl.configure(text="Projektet innehåller inga foton")
+            return
+        if not any(os.path.exists(src) for src, _m in jobs):
+            self.name_lbl.configure(
+                text="Projektets foton hittades inte — har de flyttats?")
+            return
+        if self.session and not self._confirm(
+                "Öppna projekt",
+                f"Ersätta nuvarande rulle ({len(self.session)} foton)?\n"
+                "Ändringar som inte sparats i ett projekt går förlorade."):
+            return
+        # först NU rensas nuvarande session
         self._undo.clear()
         self._redo.clear()
         self._set_enabled(self.undo_btn, False)
@@ -3804,17 +4624,13 @@ class App(tk.Tk):
         for c in self._roll_cards.values():
             c["outer"].destroy()
         self._roll_cards.clear()
+        self._roll_img_cache.clear()
+        self._cmp_cache = self._cmp_disp = None
         self.session = []
-        self.active_idx = None
+        self._clear_active_view()
         self._refresh_roll_count()
-        jobs = [(p.get("path", ""),
-                 (EditState.from_dict(p.get("edit", {})),
-                  int(p.get("rating", 0))))
-                for p in data.get("photos", [])]
-        if not jobs:
-            self.name_lbl.configure(text="Projektet innehåller inga foton")
-            return
-        self._pending_active = int(data.get("active", 0))
+        self._pending_active = int(_clampf(_finite(data.get("active"), 0),
+                                           0, len(jobs) - 1))
         self._session_path = path
         self._start_import(jobs)
 
@@ -3886,20 +4702,24 @@ class App(tk.Tk):
 
             def wndproc(hw, msg, wp, lp):
                 if msg == WM_DROPFILES:
+                    files = []
                     try:
                         n = shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
-                        files = []
                         for i in range(n):
                             ln = shell32.DragQueryFileW(wp, i, None, 0)
                             buf = ctypes.create_unicode_buffer(ln + 1)
                             shell32.DragQueryFileW(wp, i, buf, ln + 1)
                             files.append(buf.value)
-                        shell32.DragFinish(wp)
-                        if files:
-                            self.after(1, lambda f=tuple(files):
-                                       self._import_paths(f))
                     except Exception:      # noqa: BLE001
-                        pass
+                        log_error("dnd")
+                    finally:
+                        try:               # frigör ALLTID HDROP-handtaget
+                            shell32.DragFinish(wp)
+                        except Exception:      # noqa: BLE001
+                            pass
+                    if files:
+                        self.after(1, lambda f=tuple(files):
+                                   self._import_paths(f))
                     return 0
                 return user32.CallWindowProcW(self._old_wndproc, hw, msg,
                                               wp, lp)
@@ -3924,13 +4744,23 @@ class App(tk.Tk):
             # råkade stänga medan man var i F11 istället för state("zoomed")
             self._settings["maximized"] = (self.state() == "zoomed"
                                            or self._fullscreen)
-            save_settings(self._settings)
+            self._flush_settings()        # inkl. ev. debouncad ändring
         except Exception:      # noqa: BLE001 — kosmetiskt, aldrig kritiskt
             pass
         try:
             self._renderer.stop()
-        except Exception:
+        except Exception:      # noqa: BLE001
             pass
+        # avbryt schemalagda callbacks — annars kan de köras mot en redan
+        # riven Tcl-tolk ("invalid command name …_poll_render")
+        for aid in (self._poll_after, self._render_after, self._crisp_after,
+                    self._resize_after, self._thumb_after,
+                    self._settings_after):
+            if aid:
+                try:
+                    self.after_cancel(aid)
+                except Exception:      # noqa: BLE001
+                    pass
         self.destroy()
 
 

@@ -1,4 +1,4 @@
-# Filmrulle (v2.0)
+# Filmrulle (v2.1)
 
 En liten, fristående fotoredigerare för **analoga / retro filmsimuleringar**.
 Öppna ett foto, välj en filmstock, finjustera med några reglage, exportera.
@@ -21,10 +21,15 @@ egen Mac behövs för att bygga). Ladda ner `Filmrulle-macOS-*.zip` från körni
 Artifacts, packa upp och dubbelklicka `Filmrulle.app`.
 
 > Appen är **osignerad** (inget betalt Apple-utvecklarkonto), så macOS
-> Gatekeeper blockerar den första öppningen med "kan inte verifieras" eller
-> "skadad". Lösning: **högerklicka** (eller Ctrl-klick) på `Filmrulle.app` →
-> **Öppna** → bekräfta i dialogrutan. Det räcker en gång. Om det ändå klagar
-> "skadad", kör i Terminal: `xattr -cr Filmrulle.app` och försök igen.
+> Gatekeeper blockerar öppningen med "Apple kunde inte verifiera...". På
+> nyare macOS (Sequoia+) räcker inte längre högerklick → Öppna — dialogen
+> visar bara "Flytta till papperskorgen" / "Klar", inget sätt att öppna
+> ändå. **Säkraste lösningen** (funkar oavsett macOS-version): öppna
+> Terminal, skriv `xattr -cr ` (med mellanslag efter), dra in
+> `Filmrulle.app` från Finder så sökvägen fylls i, tryck Enter, dubbelklicka
+> sedan appen igen. Alternativt: Systeminställningar → Sekretess och
+> säkerhet → scrolla ner → "Öppna ändå" (dyker bara upp EFTER ett första
+> blockerat öppningsförsök).
 
 ## Format & import
 
@@ -35,8 +40,16 @@ Windows egen filväljare — markera ett eller flera foton. Man kan även **dra
 och släppa** bildfiler direkt på fönstret.
 
 Inläsningen sker i **bakgrunden** — foton dyker upp i rullen ett i taget med
-en räknare i headern, och appen förblir användbar under tiden (viktigt vid
-import av många högupplösta RAW-filer, som annars frös hela gränssnittet).
+en räknare i headern, och appen förblir användbar under tiden. Importen läser
+bara en förhandsvisning (RAW i halv upplösning, JPEG nedskalad redan vid
+avkodningen), vilket är ~3× snabbare än en full avkodning och tar ~5 MB RAM
+per foto i rullen.
+
+Formatet avgörs av filens **innehåll**, inte bara ändelsen: en JPEG som fått
+ändelsen `.DNG` (som kameraappar ibland sparar om bilder vid överföring till
+mobilen) öppnas ändå. En äkta RAW som LibRaw inte kan avkoda ger ett tydligt
+fel — aldrig tyst den 160 px-miniatyr som finns inbäddad i filen. Misslyckas
+en fil visas orsaken i statusraden.
 
 RAW-filer avkodas i **16 bitar** (kamerans sensordjup, 12–14 bitar per kanal)
 istället för att rundas av till 8 bitar direkt — det tondjupet finns kvar att
@@ -132,10 +145,12 @@ draggning); export renderas alltid i full upplösning.
 
 ## Egna presets
 
-**Preset +** sparar nuvarande look (film + reglage + tonkurva) som ett **eget
-kort** sist i filmremsan. Presets sparas i `~/.filmrulle_presets.json` och
-finns kvar mellan sessioner. **Högerklicka** på ett eget kort för att ta bort
-det — foton som använde presetens faller tillbaka på Original.
+**Preset +** sparar nuvarande look (film + reglage + tonkurva + kornstorlek/
+-struktur) som ett **eget kort** sist i filmremsan. Presets sparas i
+`~/.filmrulle_presets.json` (atomiskt — ett avbrott mitt i sparningen kan inte
+förstöra filen) och finns kvar mellan sessioner. **Högerklicka** på ett eget
+kort för att ta bort det (du får bekräfta först) — foton som använde preseten,
+även i ångra-historiken, faller tillbaka på Original.
 
 ## Beskär & räta upp
 
@@ -157,7 +172,8 @@ syns på rullens tumnaglar.
 ## Zoom
 
 **Scrolla** över fotot för att zooma in mot muspekaren — då släpps ramen och du
-kan **dra runt** bilden (loupe-läge, zoom-% visas nere till vänster).
+kan **dra runt** bilden (loupe-läge, zoom-% visas nere till vänster). Du kan
+också panorera genom att **hålla ner mittenknappen** (skrollhjulet) och dra.
 **Dubbelklick** återställer till den monterade vyn.
 
 ## Jämför (två foton sida vid sida)
@@ -186,7 +202,16 @@ recept. Det aktiva/vänstra fotot är **låst** så länge jämförelseläget ä
 - **TIFF** — förlustfritt (LZW-komprimerat), för vidare redigering i annan mjukvara.
 
 Valet gäller både **Spara** (enskilt foto) och **Exportera alla**. Vid enskild
-Spara styr även filändelsen du väljer i dialogen formatet.
+Spara styr även filändelsen du väljer i dialogen formatet. Båda renderar i
+**bakgrunden** — appen fryser inte medan fullupplösningen räknas fram.
+
+Exporten **behåller källans metadata**: kamera, objektiv­data, tagningsdatum,
+GPS (EXIF) och **färgprofil** (ICC — viktigt för iPhone-bilder i Display P3,
+som annars ser urblekta ut). Orienteringen sätts till "upprätt" eftersom
+pixlarna redan är roterade. TIFF får kamera/datum men inte hela EXIF-blocket
+(libtiff-begränsning). Filer skrivs först till en temporär fil och byts in
+när de är kompletta, så en avbruten export lämnar aldrig en trasig bild.
+Egna presets ger sitt namn som filsuffix (`foto_Min_Look.jpg`).
 
 ## Tangentbord
 
@@ -206,6 +231,9 @@ Spara styr även filändelsen du väljer i dialogen formatet.
 | `0` | Återställ zoom |
 | `F11` | Helskärm |
 | `Esc` | Backa ur innersta läget: beskärning → öppna paneler → jämförelse → helskärm → ren vy |
+
+På **macOS** fungerar även `Cmd` istället för `Ctrl`, och högerklick (ta bort
+preset/kurvpunkt) och mittenklick (panorera) är mappade rätt för Mac.
 
 Klick på den redan valda filmen nollställer justeringarna. **Mushjulet över
 ett reglage** finjusterar ett steg i taget (dragning för stora hopp, hjulet
@@ -252,12 +280,36 @@ inte äter flera GB RAM.
 **Spara projekt** (`Ctrl+Shift+S`) sparar hela rullen — filvägar, alla recept
 (film + justeringar + beskärning) och betyg — till en liten `.filmrulle`-fil.
 Bildpixlar sparas inte i projektfilen; originalen läses om från sina platser
-på disk (har en fil flyttats markeras den som saknad).
+på disk. Varje foto sparas med både absolut sökväg och sökväg **relativt
+projektfilen** — flyttar du hela mappen (foton + projekt) till en extern disk
+eller en annan dator hittas fotona ändå.
 
 **Öppna projekt:** välj `.filmrulle`-filen via vanliga **Öppna**-knappen
 (filväljaren har en egen "Filmrulle-projekt"-grupp) — eller **dra och släpp**
-projektfilen på fönstret. En enda Öppna-väg för allt; ingen separat knapp
-behövs.
+projektfilen på fönstret. Har du redan foton i rullen frågar appen innan den
+ersätts. En trasig eller handredigerad projektfil läses så långt det går
+(dåliga fält får standardvärden) och rör aldrig din nuvarande rulle om den
+inte går att öppna.
+
+## Felsökning
+
+Oväntade fel skrivs med fullständig traceback till
+`~/.filmrulle_errors.log` (den byggda exe:n har ingen konsol, så det är enda
+stället de syns) och en kort rad visas i statusfältet. Bifoga loggen om du
+rapporterar ett problem.
+
+## Tester
+
+```
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+Sviten (~90 tester, ~20 s) täcker varje bugg som hittats vid revisionerna
+samt bevisar att den prestandaoptimerade pipelinen ger samma bild (inom en
+8-bitarsnivå) som den frysta v2.0-referensen i `tests/reference_pipeline_v20.py`
+för alla filmer och slumpade justeringar. Testerna rör aldrig dina riktiga
+inställnings-/presetfiler.
 
 ## Bygga om exe
 
@@ -271,3 +323,8 @@ Kärnan är `process(arr, grade)` i `filmrulle.py` — en stegvis pipeline på e
 float32-bild (0–1): exponering → vitbalans → kontrast → per-kanal kurvor →
 mättnad → delton → ev. svartvitt → matt-lyft → halation → korn → vinjett.
 Varje `Grade` (filmen) är bara parametrar till samma pipeline.
+
+Pipelinen arbetar in-place och applicerar varje (h,w)-mask kanal för kanal
+istället för att broadcasta den mot bilden (numpy är 4–6× långsammare på
+`mask[..., None]`-mönstret), och kurvor slås upp i 65536-steg-LUT:ar istället
+för `np.interp` per pixel — ~2× snabbare rendering än v2.0 med samma resultat.
